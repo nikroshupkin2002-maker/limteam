@@ -5,12 +5,8 @@
   ],
   "crons": [
     {
-      "path": "/api/webhook?cron=morning",
-      "schedule": "0 4 * * *"
-    },
-    {
-      "path": "/api/webhook?cron=lunch",
-      "schedule": "*/15 5-13 * * *"
+      "path": "/api/webhook?cron=check",
+      "schedule": "0 * * * *"
     }
   ]
 }
