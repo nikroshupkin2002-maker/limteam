@@ -1,7 +1,7 @@
 const { Telegraf, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 
-// Инициализация бота и Supabase
+// Инициализация бота и Supabase через переменные окружения Vercel
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
@@ -33,7 +33,7 @@ const generateTimeSlots = () => {
 };
 const timeSlots = generateTimeSlots();
 
-// Главное меню
+// Главное меню бота
 const getMainMenu = () => {
   return Markup.keyboard([
     ['📊 Посмотреть все отделы', '📅 Дежурные на неделю'],
@@ -41,20 +41,21 @@ const getMainMenu = () => {
   ]).resize();
 };
 
+// Красивое форматирование имени из Telegram в "Имя Ф."
 const formatTelegramName = (from) => {
   const firstName = from.first_name || '';
   const lastName = from.last_name || '';
   return firstName && lastName ? `${firstName} ${lastName.charAt(0)}.` : (firstName || `User_${from.id}`);
 };
 
-// Функция массовой рассылки уведомлений всем пользователям бота
+// Функция массовой автоматической рассылки уведомлений всей команде
 const notifyAllUsers = async (textMessage, excludeUserId) => {
-  // Вытаскиваем все ID пользователей из Supabase
+  // Вытаскиваем все ID зарегистрированных пользователей из Supabase
   const { data: users } = await supabase.from('users').select('id');
   if (!users) return;
 
   for (const user of users) {
-    if (user.id === excludeUserId) continue; // Пропускаем автора изменений
+    if (user.id === excludeUserId) continue; // Пропускаем того, кто сделал изменения
     try {
       await bot.telegram.sendMessage(user.id, textMessage, { parse_mode: 'Markdown' });
     } catch (err) {
@@ -63,10 +64,12 @@ const notifyAllUsers = async (textMessage, excludeUserId) => {
   }
 };
 
-// Старт бота
+// Команда /start
 bot.start(async (ctx) => {
   const userId = ctx.from.id;
-  const { data: user } = await supabase.from('users').select('name').eq('id', userId).single();
+  
+  // Используем .maybeSingle() вместо .single(), чтобы код не падал, если юзера нет в базе
+  const { data: user, error } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
 
   if (user) {
     ctx.reply(`Рад видеть вас снова, ${user.name}!`, getMainMenu());
@@ -78,11 +81,12 @@ bot.start(async (ctx) => {
   }
 });
 
-// Регистрация в Supabase
+// Кнопка автоматической регистрации
 bot.action('auto_register', async (ctx) => {
   const userId = ctx.from.id;
   const formattedName = formatTelegramName(ctx.from);
 
+  // Сохраняем или обновляем пользователя в таблице users
   await supabase.from('users').upsert({ id: userId, name: formattedName });
 
   ctx.answerCbQuery('Регистрация успешна! 🎉');
@@ -90,7 +94,7 @@ bot.action('auto_register', async (ctx) => {
   ctx.reply('Используйте меню ниже:', getMainMenu());
 });
 
-// Просмотр расписания
+// Просмотр общего расписания по отделам
 bot.hears('📊 Посмотреть все отделы', async (ctx) => {
   const { data: dbBookings } = await supabase.from('bookings').select('*');
   let response = '📋 *Текущая очередь по отделам:*\n\n';
@@ -113,7 +117,7 @@ bot.hears('📊 Посмотреть все отделы', async (ctx) => {
     });
     response += '\n';
   }
-  ctx.replyWithMarkdown(response || "Пока броней нет.");
+  ctx.replyWithMarkdown(response);
 });
 
 // Просмотр дежурных на неделю
@@ -132,35 +136,35 @@ bot.hears('📅 Дежурные на неделю', async (ctx) => {
   ctx.replyWithMarkdown(text, Markup.inlineKeyboard(buttons));
 });
 
-// Смена дежурного + автоуведомление всей команды
+// Назначение себя дежурным на определенный день + автооповещение
 bot.action(/^edit_duty_(.+)$/, async (ctx) => {
   const day = ctx.match[1];
   const userId = ctx.from.id;
   
-  const { data: user } = await supabase.from('users').select('name').eq('id', userId).single();
+  const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
   const savedName = user ? user.name : formatTelegramName(ctx.from);
 
-  // Обновляем запись в Supabase
+  // Обновляем имя дежурного в Supabase
   await supabase.from('duty').update({ duty_name: savedName }).eq('day_of_week', day);
 
   ctx.answerCbQuery(`Вы назначены дежурным на ${day}!`);
   ctx.editMessageText(`Вы успешно записались дежурным на *${day}*! Команда получила уведомление.`, { parse_mode: 'Markdown' });
 
-  // Массовая рассылка «мозгами» бота по таблице пользователей
+  // Запуск рассылки: бот сам отправляет сообщение всем подключенным коллегам
   await notifyAllUsers(`🔔 *Обновление графика!* \n\n👤 *${savedName}* назначен дежурным на *${day}*.`, userId);
 });
 
-// Шаг 1 бронирования: выбор отдела
+// Шаг 1 бронирования lunch-слота: выбор отдела
 bot.hears('🙋 Забронировать место', async (ctx) => {
   const userId = ctx.from.id;
-  const { data: user } = await supabase.from('users').select('name').eq('id', userId).single();
-  if (!user) return ctx.reply('Сначала зарегистрируйтесь!');
+  const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
+  if (!user) return ctx.reply('Сначала зарегистрируйтесь через верхнюю кнопку!');
 
   const buttons = allDepartments.map(dep => [Markup.button.callback(dep, `select_dep_${dep}`)]);
   ctx.reply('Выберите ваш отдел:', Markup.inlineKeyboard(buttons));
 });
 
-// Шаг 2 бронирования: выбор времени
+// Шаг 2 бронирования lunch-слота: выбор доступного времени
 bot.action(/^select_dep_(.+)$/, (ctx) => {
   const dep = ctx.match[1];
   const buttons = [];
@@ -173,14 +177,14 @@ bot.action(/^select_dep_(.+)$/, (ctx) => {
   ctx.editMessageText(`Отдел *${dep}*. Выберите время:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
-// Шаг 3 бронирования: запись
+// Шаг 3 бронирования lunch-слота: запись в Supabase
 bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
   const dep = ctx.match[1];
   const slotIndex = parseInt(ctx.match[2]);
   const slot = timeSlots[slotIndex];
   const userId = ctx.from.id;
 
-  const { data: user = null } = await supabase.from('users').select('name').eq('id', userId).single();
+  const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
   const userName = user ? user.name : formatTelegramName(ctx.from);
 
   // Проверяем, не занято ли уже это время кем-то другим в этом отделе
@@ -189,17 +193,17 @@ bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
     return ctx.answerCbQuery(`Слот уже занят сотрудником ${checkDep[0].user_name}!`, { show_alert: true });
   }
 
-  // Удаляем старые записи этого пользователя только в ЭТОМ отделе
+  // Очищаем старые бронирования этого пользователя только в ЭТОМ конкретном отделе
   await supabase.from('bookings').delete().eq('user_id', userId).eq('department', dep);
 
-  // Добавляем новую бронь
+  // Записываем новую бронь в базу данных
   await supabase.from('bookings').insert({ user_id: userId, department: dep, time_slot: slot, user_name: userName });
 
   ctx.answerCbQuery(`Успешно записаны! 🎉`);
   ctx.editMessageText(`Вы записаны в отдел *${dep}* на *${slot}*.`, { parse_mode: 'Markdown' });
 });
 
-// Отмена броней
+// Отмена всех броней текущего пользователя
 bot.hears('❌ Отменить мою бронь', async (ctx) => {
   const userId = ctx.from.id;
   const { error } = await supabase.from('bookings').delete().eq('user_id', userId);
@@ -211,16 +215,16 @@ bot.hears('❌ Отменить мою бронь', async (ctx) => {
   }
 });
 
+// Обработчик серверлесс-функции Vercel
 module.exports = async (req, res) => {
   try {
     if (req.method === 'POST') {
       await bot.handleUpdate(req.body, res);
     } else {
-      res.status(200).send('Бот на Supabase готов!');
+      res.status(200).send('Бот на Supabase успешно запущен и работает!');
     }
   } catch (error) {
-    console.error(error);
-    res.status(500).send('Ошибка сервера');
+    console.error('Ошибка обработки хука:', error);
+    res.status(500).send('Внутренняя ошибка сервера');
   }
 };
- 
