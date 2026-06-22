@@ -2,66 +2,68 @@ const { Telegraf, Markup } = require('telegraf');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Хранилище пользователей (в памяти)
-// Структура: { userId: "Имя Фамилия" }
+// База данных пользователей в памяти
 let usersDatabase = {};
 
-// Списки отделов по группам для отображения
+// Группировка для вывода занятых позиций
 const departmentGroups = {
   "Группа (Аутлет, Обувь, Альпинизм)": ["Аутлет", "Обувь", "Альпинизм"],
   "Группа (Центр, Одежда, Плавание)": ["Центр", "Одежда", "Плавание"],
   "Велосипедный отдел": ["Вело"]
 };
 
+// Все доступные отделы
 const allDepartments = ["Аутлет", "Альпинизм", "Обувь", "Центр", "Одежда", "Плавание", "Вело"];
 
-// Генерируем слоты времени
-// Завтрак: 10:00 - 12:00 (15 мин), Обед: 12:00 - 18:00 (30 мин)
+// Генерация временных слотов (Завтрак 10-12 по 15 мин, Обед 12-18 по 30 мин)
 const generateTimeSlots = () => {
   const slots = [];
-  
-  // Завтраки (10:00 - 12:00) по 15 минут
   let h = 10, m = 0;
   while (h < 12) {
     let startTime = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
     m += 15;
     if (m >= 60) { m = 0; h++; }
-    let endTime = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-    slots.push(`${startTime} - ${endTime} (Завтрак)`);
+    slots.push(`${startTime} (Завтрак)`);
   }
-  
-  // Обеды (12:00 - 18:00) по 30 минут
   h = 12; m = 0;
   while (h < 18) {
     let startTime = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
     m += 30;
     if (m >= 60) { m = 0; h++; }
-    let endTime = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-    slots.push(`${startTime} - ${endTime} (Обед)`);
+    slots.push(`${startTime} (Обед)`);
   }
   return slots;
 };
 
 const timeSlots = generateTimeSlots();
 
-// Структура броней: { "Аутлет": { "10:00 - 10:15 (Завтрак)": [ {id, name} ] } }
+// Инициализация структуры бронирований
 let bookings = {};
 allDepartments.forEach(dep => {
   bookings[dep] = {};
-  timeSlots.forEach(slot => {
-    bookings[dep][slot] = [];
-  });
+  timeSlots.forEach(slot => { bookings[dep][slot] = []; });
 });
 
-// Состояние ожидания ввода имени { userId: true }
-let awaitingName = {};
-
-// Главное меню
+// Главное меню бота
 const getMainMenu = () => {
   return Markup.keyboard([
-    ['📊 Посмотреть все отделы', '🙋 Забронировать место'],
-    ['❌ Отменить мою бронь']
+    ['📊 Посмотреть все отделы'],
+    ['🙋 Забронировать место', '❌ Отменить мою бронь']
   ]).resize();
+};
+
+// Функция для форматирования имени в формат "Имя Ф."
+const formatTelegramName = (from) => {
+  const firstName = from.first_name || '';
+  const lastName = from.last_name || '';
+  
+  if (firstName && lastName) {
+    return `${firstName} ${lastName.charAt(0)}.`;
+  } else if (firstName) {
+    return firstName;
+  } else {
+    return from.username ? `@${from.username}` : `User_${from.id}`;
+  }
 };
 
 // Команда /start
@@ -69,14 +71,31 @@ bot.start((ctx) => {
   const userId = ctx.from.id;
   
   if (usersDatabase[userId]) {
-    ctx.reply(`Рад видеть вас снова, ${usersDatabase[userId]}! Чем могу помочь?`, getMainMenu());
+    ctx.reply(`Рад видеть вас снова, ${usersDatabase[userId]}!`, getMainMenu());
   } else {
-    ctx.reply('Привет! Для работы с ботом необходимо зарегистрироваться.\n\nКак Вас зовут? Введите, пожалуйста, Ваши *Имя и Фамилию*:', { parse_mode: 'Markdown' });
-    awaitingName[userId] = true;
+    // Предлагаем кнопку для автоматической регистрации по данным TG
+    ctx.reply(
+      'Привет! Для работы с ботом необходимо зафиксировать Ваше имя в системе.',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('👤 Зарегистрироваться под своим именем', 'auto_register')]
+      ])
+    );
   }
 });
 
-// Просмотр занятых позиций по связанным группам
+// Обработка автоматической регистрации
+bot.action('auto_register', (ctx) => {
+  const userId = ctx.from.id;
+  const formattedName = formatTelegramName(ctx.from);
+  
+  usersDatabase[userId] = formattedName;
+  
+  ctx.answerCbQuery('Регистрация успешна! 🎉');
+  ctx.editMessageText(`Отлично! Вы зарегистрированы как: *${formattedName}*.\nТеперь вам доступны бронирования.`, { parse_mode: 'Markdown' });
+  ctx.reply('Используйте меню ниже:', getMainMenu());
+});
+
+// Просмотр расписания по связанным группам отделов
 bot.hears('📊 Посмотреть все отделы', (ctx) => {
   let response = '📋 *Текущая очередь по отделам:*\n\n';
 
@@ -84,10 +103,9 @@ bot.hears('📊 Посмотреть все отделы', (ctx) => {
     response += `📦 *${groupName.toUpperCase()}*\n`;
     response += `— — — — — — — — — — — — —\n`;
     
-    // Для каждого слота времени проверяем запись в отделах этой группы
     timeSlots.forEach(slot => {
       let slotHasBookings = false;
-      let slotText = `⏰ *${slot.split(' ')[0]}*:\n`; // Только время, без слова Завтрак/Обед для компактности
+      let slotText = `⏰ *${slot.split(' ')[0]}*:\n`;
       
       deps.forEach(dep => {
         const users = bookings[dep][slot] || [];
@@ -99,24 +117,24 @@ bot.hears('📊 Посмотреть все отделы', (ctx) => {
         }
       });
       
-      if (slotHasBookings) {
-        response += slotText;
-      }
+      if (slotHasBookings) response += slotText;
     });
     response += '\n';
   }
 
-  ctx.replyWithMarkdown(response || "Пока никто ничего не забронировал.");
+  ctx.replyWithMarkdown(response || "Пока броней нет.");
 });
 
-// Шаг 1 бронирования: выбор отдела
+// Шаг 1 бронирования: выбор отдела (каждая кнопка на отдельной строке)
 bot.hears('🙋 Забронировать место', (ctx) => {
   const userId = ctx.from.id;
   if (!usersDatabase[userId]) {
-    return ctx.reply('Сначала введите ваше Имя и Фамилию для регистрации!');
+    return ctx.reply('Сначала нажмите кнопку регистрации в начале диалога!');
   }
 
+  // Создаем массив, где каждый отдел — это отдельный ряд кнопок [строка]
   const buttons = allDepartments.map(dep => [Markup.button.callback(dep, `select_dep_${dep}`)]);
+  
   ctx.reply('Выберите ваш отдел:', Markup.inlineKeyboard(buttons));
 });
 
@@ -124,17 +142,16 @@ bot.hears('🙋 Забронировать место', (ctx) => {
 bot.action(/^select_dep_(.+)$/, (ctx) => {
   const dep = ctx.match[1];
   
-  // Генерируем кнопки времени (по 2 в ряд для компактности)
+  // Кнопки времени делаем по 3 в ряд для компактности прокрутки
   const buttons = [];
-  for (let i = 0; i < timeSlots.length; i += 2) {
+  for (let i = 0; i < timeSlots.length; i += 3) {
     const row = [Markup.button.callback(timeSlots[i].split(' ')[0], `book_${dep}_${i}`)];
-    if (timeSlots[i+1]) {
-      row.push(Markup.button.callback(timeSlots[i+1].split(' ')[0], `book_${dep}_${i+1}`));
-    }
+    if (timeSlots[i+1]) row.push(Markup.button.callback(timeSlots[i+1].split(' ')[0], `book_${dep}_${i+1}`));
+    if (timeSlots[i+2]) row.push(Markup.button.callback(timeSlots[i+2].split(' ')[0], `book_${dep}_${i+2}`));
     buttons.push(row);
   }
   
-  ctx.editMessageText(`Вы выбрали отдел *${dep}*.\nТеперь выберите удобное время:`, {
+  ctx.editMessageText(`Вы выбрали отдел *${dep}*.\nВыберите удобное время:`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard(buttons)
   });
@@ -146,26 +163,24 @@ bot.action(/^book_(.+)_(.+)$/, (ctx) => {
   const slotIndex = parseInt(ctx.match[2]);
   const slot = timeSlots[slotIndex];
   const userId = ctx.from.id;
-  const userSavedName = usersDatabase[userId] || ctx.from.first_name;
+  const userSavedName = usersDatabase[userId] || formatTelegramName(ctx.from);
 
-  // Проверка на дубликат в ЭТОМ ЖЕ отделе на ЭТО ЖЕ время
   if (bookings[dep][slot].some(u => u.id === userId)) {
-    return ctx.answerCbQuery('Вы уже записаны на это время в данном отделе! 🤨', { show_alert: true });
+    return ctx.answerCbQuery('Вы уже записаны на это время здесь! 🤨', { show_alert: true });
   }
 
-  // Удаляем старые записи пользователя в ЭТОМ отделе (чтобы не занимал много слотов сразу)
+  // Сбрасываем прошлые записи человека только в этом конкретном отделе
   timeSlots.forEach(s => {
     bookings[dep][s] = bookings[dep][s].filter(u => u.id !== userId);
   });
 
-  // Записываем
   bookings[dep][slot].push({ id: userId, name: userSavedName });
 
-  ctx.answerCbQuery(`Успешно записаны на ${slot.split(' ')[0]}! 🎉`);
-  ctx.editMessageText(`Отлично! Вы записаны в отдел *${dep}* на время *${slot}*.\nПроверить общую очередь можно через меню.`, { parse_mode: 'Markdown' });
+  ctx.answerCbQuery(`Успешно записаны! 🎉`);
+  ctx.editMessageText(`Готово! Вы записаны в отдел *${dep}* на время *${slot}*.\nПроверить занятые слоты можно через кнопку «Посмотреть все отделы».`, { parse_mode: 'Markdown' });
 });
 
-// Отмена брони (удаляет записи пользователя из всех отделов)
+// Отмена брони
 bot.hears('❌ Отменить мою бронь', (ctx) => {
   let found = false;
   const userId = ctx.from.id;
@@ -179,28 +194,9 @@ bot.hears('❌ Отменить мою бронь', (ctx) => {
   });
 
   if (found) {
-    ctx.reply('Ваши бронирования во всех отделах успешно отменены.', getMainMenu());
+    ctx.reply('Ваша бронь во всех отделах успешно отменена.', getMainMenu());
   } else {
-    ctx.reply('У вас не было активных броней.', getMainMenu());
-  }
-});
-
-// Текстовый обработчик для перехвата Имени и Фамилии при регистрации
-bot.on('text', (ctx) => {
-  const userId = ctx.from.id;
-
-  if (awaitingName[userId]) {
-    const fullName = ctx.message.text.trim();
-    
-    // Простая валидация, что ввели хотя бы два слова
-    if (fullName.split(' ').length < 2) {
-      return ctx.reply('Пожалуйста, введите и *Имя*, и *Фамилию* через пробел:');
-    }
-
-    usersDatabase[userId] = fullName;
-    delete awaitingName[userId];
-
-    ctx.reply(`Успешно! Вы зарегистрированы как: *${fullName}*.\nТеперь вы можете пользоваться расписанием.`, getMainMenu({ parse_mode: 'Markdown' }));
+    ctx.reply('Активных броней не найдено.', getMainMenu());
   }
 });
 
@@ -209,7 +205,7 @@ module.exports = async (req, res) => {
     if (req.method === 'POST') {
       await bot.handleUpdate(req.body, res);
     } else {
-      res.status(200).send('Бот отделов обедов работает!');
+      res.status(200).send('Бот обновлен!');
     }
   } catch (error) {
     console.error(error);
