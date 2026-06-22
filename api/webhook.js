@@ -4,13 +4,15 @@ const { createClient } = require('@supabase/supabase-js');
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
+// Группы отделов для очереди обедов
 const departmentGroups = {
   "Группа (Аутлет, Обувь, Альпинизм)": ["Аутлет", "Обувь", "Альпинизм"],
   "Группа (Центр, Одежда, Плавание)": ["Центр", "Одежда", "Плавание"],
-  "Велосипедный отдел": ["Вело"]
+  "Велосипедный отдел / Касса": ["Вело", "Касса"]
 };
 
-const allDepartments = ["Аутлет", "Альпинизм", "Обувь", "Центр", "Одежда", "Плавание", "Вело"];
+// Все существующие отделы системы
+const allDepartments = ["Аутлет", "Альпинизм", "Обувь", "Центр", "Одежда", "Плавание", "Вело", "Касса"];
 const daysOfWeek = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
 
 const generateTimeSlots = () => {
@@ -31,12 +33,13 @@ const generateTimeSlots = () => {
 };
 const timeSlots = generateTimeSlots();
 
-// Обновленное главное меню с новыми кнопками
+// Главное меню с новыми кнопками
 const getMainMenu = () => {
   return Markup.keyboard([
     ['📊 Посмотреть все отделы', '📅 Дежурные на неделю'],
-    ['🔥 Дежурные на сегодня', '📝 График работы'],
-    ['🙋 Забронировать место', '❌ Отменить мою бронь']
+    ['🔥 Дежурные на сегодня', '📆 График на сегодня'],
+    ['📝 График работы на неделю', '🙋 Забронировать место'],
+    ['❌ Отменить мою бронь']
   ]).resize();
 };
 
@@ -50,7 +53,6 @@ const isStaff = (role) => {
   return role === 'admin' || role === 'manager';
 };
 
-// Функция получения текущего дня недели по Алматы
 const getAlmatyDayName = () => {
   const days = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
   return days[new Date(Date.now() + 5 * 60 * 60 * 1000).getDay()];
@@ -63,7 +65,7 @@ bot.start(async (ctx) => {
 
   if (user) {
     let welcomeText = `Рад видеть вас снова, ${user.name}!`;
-    if (isStaff(user.role)) welcomeText += ` 👑 (Админ-режим активен)`;
+    if (isStaff(user.role)) welcomeText += ` 👑 (Администратор)`;
     ctx.reply(welcomeText, getMainMenu());
   } else {
     ctx.reply(
@@ -110,7 +112,6 @@ bot.hears('📊 Посмотреть все отделы', async (ctx) => {
   ctx.replyWithMarkdown(response);
 });
 
-// Вспомогательная функция для сборки текста дежурных
 const buildDutiesText = (duties) => {
   let text = '';
   allDepartments.forEach(dep => {
@@ -149,25 +150,39 @@ bot.hears('🔥 Дежурные на сегодня', async (ctx) => {
 
   let text = `🔥 *Дежурные сотрудники на СЕГОДНЯ (${today}):*\n\n`;
   text += buildDutiesText(todayDuties);
-  
   ctx.replyWithMarkdown(text);
 });
 
-// 4. ПРОСМОТР И УПРАВЛЕНИЕ ГРАФИКОМ РАБОТЫ
-bot.hears('📝 График работы', async (ctx) => {
+// Вспомогательная функция для сборки текста графика работы
+const buildScheduleText = (day, scheduleData) => {
+  let text = `📅 *${day}:*\n`;
+  const daySchedule = scheduleData?.filter(s => s.day_of_week === day) || [];
+  allDepartments.forEach(dep => {
+    const workers = daySchedule.filter(s => s.department === dep).map(s => s.user_name).join(', ');
+    text += `  └ *${dep}*: ${workers || 'Никто не работает ❌'}\n`;
+  });
+  return text;
+};
+
+// 4. ГРАФИК НА СЕГОДНЯ (Новая кнопка)
+bot.hears('📆 График на сегодня', async (ctx) => {
+  const today = getAlmatyDayName();
+  const { data: scheduleData } = await supabase.from('schedule').select('*').eq('day_of_week', today);
+
+  let text = `📆 *График работы сотрудников на СЕГОДНЯ (${today}):*\n\n`;
+  text += buildScheduleText(today, scheduleData);
+  ctx.replyWithMarkdown(text);
+});
+
+// 5. ПРОСМОТР И УПРАВЛЕНИЕ ГРАФИКОМ НА НЕДЕЛЮ
+bot.hears('📝 График работы на неделю', async (ctx) => {
   const userId = ctx.from.id.toString();
   const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
   const { data: scheduleData } = await supabase.from('schedule').select('*');
 
   let text = '📝 *Текущий график работы сотрудников на неделю:*\n\n';
   daysOfWeek.forEach(day => {
-    text += `📅 *${day}:*\n`;
-    const daySchedule = scheduleData?.filter(s => s.day_of_week === day) || [];
-    
-    allDepartments.forEach(dep => {
-      const workers = daySchedule.filter(s => s.department === dep).map(s => s.user_name).join(', ');
-      text += `  └ *${dep}*: ${workers || 'Никто не работает ❌'}\n`;
-    });
+    text += buildScheduleText(day, scheduleData);
     text += '\n';
   });
 
@@ -181,7 +196,7 @@ bot.hears('📝 График работы', async (ctx) => {
 
 
 // ==========================================
-// ЛОГИКА АДМИНКИ: РЕДАКТИРОВАНИЕ ГРАФИКА РАБОТЫ
+// ИСПРАВЛЕННАЯ АДМИНКА ГРАФИКА РАБОТЫ
 // ==========================================
 
 bot.action(/^sched_day_(.+)$/, async (ctx) => {
@@ -190,50 +205,59 @@ bot.action(/^sched_day_(.+)$/, async (ctx) => {
   ctx.editMessageText(`Редактирование графика на *${day}*.\nВыберите отдел:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
-bot.action(/^sched_dep_(.+)_(.+)$/, async (ctx) => {
-  const day = ctx.match[1];
-  const dep = ctx.match[2];
-
+// Отрендерить меню выбора сотрудников со статусами (кто уже добавлен, а кто нет)
+const renderWorkersMenu = async (ctx, day, dep) => {
   const { data: allUsers } = await supabase.from('users').select('id, name');
+  const { data: currentWorkers } = await supabase.from('schedule').select('user_id').eq('day_of_week', day).eq('department', dep);
+  
   if (!allUsers || allUsers.length === 0) return ctx.answerCbQuery('Нет пользователей в базе');
 
-  // Генерируем кнопки для каждого пользователя
-  const buttons = allUsers.map(u => [Markup.button.callback(`➕ Добавить/Удалить: ${u.name}`, `sched_toggle_${day}_${dep}_${u.id}`)]);
-  buttons.push([Markup.button.callback('⬅️ Назад к отделам', `sched_day_${day}`)]);
+  const workerIds = currentWorkers?.map(w => w.user_id.toString()) || [];
 
-  ctx.editMessageText(`Управление сотрудниками в отделе *${dep}* на *${day}*.\nНажмите на имя сотрудника, чтобы добавить или убрать его из смены:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  const buttons = allUsers.map(u => {
+    const isAdded = workerIds.includes(u.id.toString());
+    // Если добавлен — показываем галочку, если нет — плюс
+    const label = isAdded ? `✅ ${u.name} (В смене)` : `➕ ${u.name}`;
+    return [Markup.button.callback(label, `sched_toggle_${day}_${dep}_${u.id}`)];
+  });
+
+  buttons.push([Markup.button.callback('⬅️ Назад к отделам', `sched_day_${day}`)]);
+  
+  await ctx.editMessageText(
+    `Управление сменами: отдел *${dep}*, день *${day}*.\nНажмите на имя сотрудника, чтобы добавить или удалить его из графика:`, 
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+  );
+};
+
+bot.action(/^sched_dep_(.+)_(.+)$/, async (ctx) => {
+  await renderWorkersMenu(ctx, ctx.match[1], ctx.match[2]);
 });
 
 bot.action(/^sched_toggle_(.+)_(.+)_(.+)$/, async (ctx) => {
   const day = ctx.match[1];
   const dep = ctx.match[2];
-  const targetUserId = ctx.match[3];
+  const targetUserId = ctx.match[3].toString();
 
-  // Проверяем, стоит ли уже человек в графике на этот день в этом отделе
-  const { data: exist } = await supabase.from('schedule').select('*').eq('day_of_week', day).eq('department', dep).eq('user_id', targetUserId).maybeSingle();
+  const { data: exist } = await supabase.from('schedule').select('id').eq('day_of_week', day).eq('department', dep).eq('user_id', targetUserId).maybeSingle();
 
   if (exist) {
-    // Если уже стоит — удаляем из смены
     await supabase.from('schedule').delete().eq('id', exist.id);
-    ctx.answerCbQuery('Сотрудник убран из графика');
+    ctx.answerCbQuery('Сотрудник удален из графика');
   } else {
-    // Если нет — добавляем в смену
     const { data: user } = await supabase.from('users').select('name').eq('id', targetUserId).maybeSingle();
-    await supabase.from('schedule').insert({ user_id: targetUserId, user_name: user.name, day_of_week: day, department: dep });
-    ctx.answerCbQuery('Сотрудник добавлен в график');
+    if (user) {
+      await supabase.from('schedule').insert({ user_id: targetUserId, user_name: user.name, day_of_week: day, department: dep });
+      ctx.answerCbQuery('Сотрудник добавлен в график 🎉');
+    }
   }
 
-  // Возвращаем в меню управления этим же отделом
-  const { data: allUsers } = await supabase.from('users').select('id, name');
-  const buttons = allUsers.map(u => [Markup.button.callback(`➕ Добавить/Удалить: ${u.name}`, `sched_toggle_${day}_${dep}_${u.id}`)]);
-  buttons.push([Markup.button.callback('⬅️ Назад к отделам', `sched_day_${day}`)]);
-  
-  ctx.editMessageText(`Управление сотрудниками в отделе *${dep}* на *${day}*.\nГрафик успешно обновлен.`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  // Мгновенно перерисовываем это же меню со свежими статусами галочек
+  await renderWorkersMenu(ctx, day, dep);
 });
 
 
 // ==========================================
-// ЛОГИКА АДМИНКИ: УМНОЕ НАЗНАЧЕНИЕ ДЕЖУРНЫХ (СВЯЗАННОЕ С ГРАФИКОМ)
+// НАЗНАЧЕНИЕ ДЕЖУРНЫХ (СВЯЗАННОЕ С ГРАФИКОМ)
 // ==========================================
 
 bot.action(/^staff_day_(.+)$/, async (ctx) => {
@@ -246,20 +270,18 @@ bot.action(/^staff_dep_(.+)_(.+)$/, async (ctx) => {
   const day = ctx.match[1];
   const dep = ctx.match[2];
 
-  // КЛЮЧЕВАЯ СВЯЗКА: Достаем из таблицы schedule только тех людей, кто РАБОТАЕТ в этот день в этом отделе
   const { data: workersToday } = await supabase.from('schedule').select('user_id, user_name').eq('day_of_week', day).eq('department', dep);
   
   if (!workersToday || workersToday.length === 0) {
     const buttons = [[Markup.button.callback('⬅️ Назад к отделам', `staff_day_${day}`)]];
-    return ctx.editMessageText(`❌ Нельзя назначить дежурного на *${day}* в отдел *${dep}*.\n\nПо графику работы в этот день в данном отделе *никто не числится*. Сначала заполните «📝 График работы»!`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    return ctx.editMessageText(`❌ Нельзя назначить дежурного на *${day}* в отдел *${dep}*.\n\nПо графику работы в этот день в данном отделе *никто не числится*. Сначала заполните график!`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
   }
 
-  // Показываем кнопки только тех людей, кто реально работает по графику
   const buttons = workersToday.map(w => [Markup.button.callback(w.user_name, `assign_duty_${day}_${dep}_${w.user_id}`)]);
   buttons.push([Markup.button.callback('❌ Сбросить дежурного', `assign_duty_${day}_${dep}_clear`)]);
   buttons.push([Markup.button.callback('⬅️ Назад', `staff_day_${day}`)]);
 
-  ctx.editMessageText(`Назначаем дежурного в отдел *${dep}* на *${day}*.\nДоступны только сотрудники, стоящие сегодня в смене по графику:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  ctx.editMessageText(`Назначаем дежурного в отдел *${dep}* на *${day}*.\nДоступны только сотрудники, стоящие в смене по графику:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
 bot.action(/^assign_duty_(.+)_(.+)_(.+)$/, async (ctx) => {
@@ -289,7 +311,7 @@ bot.action(/^assign_duty_(.+)_(.+)_(.+)$/, async (ctx) => {
 
 
 // ==========================================
-// ЛОГИКА БРОНИРОВАНИЯ ОБЕДОВ (БЕЗ ИЗМЕНЕНИЙ)
+// БРОНИРОВАНИЯ (ОБЕДЫ)
 // ==========================================
 
 bot.hears('🙋 Забронировать место', async (ctx) => {
@@ -319,8 +341,8 @@ bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
   const slot = timeSlots[slotIndex];
   const userId = ctx.from.id.toString(); 
 
-  const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
-  const userName = user ? user.name : formatTelegramName(ctx.from);
+  const { data: user = formatTelegramName(ctx.from) } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
+  const userName = user?.name || user;
 
   const { data: checkDep } = await supabase.from('bookings').select('*').eq('department', dep).eq('time_slot', slot);
   if (checkDep && checkDep.length > 0) {
@@ -340,54 +362,10 @@ bot.hears('❌ Отменить мою бронь', async (ctx) => {
   ctx.reply(error ? 'Активных броней не найдено.' : 'Все ваши бронирования успешно отменены.', getMainMenu());
 });
 
-
-// ==========================================
-// ПЛАНИРОВЩИК УВЕДОМЛЕНИЙ (CRON)
-// ==========================================
-
-const handleUnifiedCron = async () => {
-  const ALMATY_HOUR = new Date(Date.now() + 5 * 60 * 60 * 1000).getHours(); 
-  const todayName = getAlmatyDayName();
-
-  if (ALMATY_HOUR === 9) {
-    const { data: todayDuties } = await supabase.from('duty').select('*').eq('day_of_week', todayName);
-    if (todayDuties && todayDuties.length > 0) {
-      for (const duty of todayDuties) {
-        try {
-          await bot.telegram.sendMessage(
-            duty.user_id, 
-            `☀️ *Доброе утро!* Напоминаем, что сегодня ты назначен дежурным в отдел *${duty.department}*. Удачной смены!`, 
-            { parse_mode: 'Markdown' }
-          );
-        } catch (e) {}
-      }
-    }
-  }
-
-  const { data: allBookings } = await supabase.from('bookings').select('*');
-  if (allBookings && allBookings.length > 0) {
-    const nextHourStr = String(ALMATY_HOUR).padStart(2, '0');
-    const matchingBookings = allBookings.filter(b => b.time_slot.startsWith(`${nextHourStr}:15`));
-
-    for (const booking of matchingBookings) {
-      try {
-        await bot.telegram.sendMessage(
-          booking.user_id,
-          `⏳ *Напоминание за 15 минут!* Скоро твое время обеда/завтрака:\n📍 Отдел: *${booking.department}*\n⏰ Время: *${booking.time_slot}*`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (e) {}
-    }
-  }
-};
-
 module.exports = async (req, res) => {
   try {
     if (req.method === 'POST') {
       await bot.handleUpdate(req.body, res);
-    } else if (req.query.cron === 'check') {
-      await handleUnifiedCron();
-      res.status(200).send('Unified cron executed successfully');
     } else {
       res.status(200).send('Бот на Supabase работает стабильно!');
     }
