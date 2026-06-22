@@ -2,5 +2,15 @@
   "version": 2,
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/webhook" }
+  ],
+  "crons": [
+    {
+      "path": "/api/webhook?cron=morning",
+      "schedule": "0 4 * * *"
+    },
+    {
+      "path": "/api/webhook?cron=lunch",
+      "schedule": "*/15 5-13 * * *"
+    }
   ]
 }
