@@ -1,7 +1,6 @@
 const { Telegraf, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 
-// Инициализация бота и Supabase через переменные окружения Vercel
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
@@ -14,26 +13,24 @@ const departmentGroups = {
 const allDepartments = ["Аутлет", "Альпинизм", "Обувь", "Центр", "Одежда", "Плавание", "Вело"];
 const daysOfWeek = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
 
-// Генерация временных слотов (Завтрак 10-12 по 15 мин, Обед 12-18 по 30 мин)
 const generateTimeSlots = () => {
   const slots = [];
   let h = 10, m = 0;
   while (h < 12) {
     let startTime = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-    m += 15; if (m >= 60) { m = 0; h++; }
     slots.push(`${startTime} (Завтрак)`);
+    m += 15; if (m >= 60) { m = 0; h++; }
   }
   h = 12; m = 0;
   while (h < 18) {
     let startTime = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-    m += 30; if (m >= 60) { m = 0; h++; }
     slots.push(`${startTime} (Обед)`);
+    m += 30; if (m >= 60) { m = 0; h++; }
   }
   return slots;
 };
 const timeSlots = generateTimeSlots();
 
-// Главное меню бота
 const getMainMenu = () => {
   return Markup.keyboard([
     ['📊 Посмотреть все отделы', '📅 Дежурные на неделю'],
@@ -41,36 +38,26 @@ const getMainMenu = () => {
   ]).resize();
 };
 
-// Красивое форматирование имени из Telegram в "Имя Ф."
 const formatTelegramName = (from) => {
   const firstName = from.first_name || '';
   const lastName = from.last_name || '';
   return firstName && lastName ? `${firstName} ${lastName.charAt(0)}.` : (firstName || `User_${from.id}`);
 };
 
-// Функция массовой автоматической рассылки уведомлений всей команде
-const notifyAllUsers = async (textMessage, excludeUserId) => {
-  const { data: users } = await supabase.from('users').select('id');
-  if (!users) return;
-
-  for (const user of users) {
-    if (user.id === excludeUserId) continue; // Пропускаем автора изменений
-    try {
-      await bot.telegram.sendMessage(user.id, textMessage, { parse_mode: 'Markdown' });
-    } catch (err) {
-      console.log(`Ошибка отправки пользователю ${user.id}:`, err.message);
-    }
-  }
+// Проверка: является ли пользователь админом или старшим
+const isStaff = (role) => {
+  return role === 'admin' || role === 'manager';
 };
 
 // Команда /start
 bot.start(async (ctx) => {
   const userId = ctx.from.id.toString(); 
-  
-  const { data: user, error } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
+  const { data: user } = await supabase.from('users').select('name, role').eq('id', userId).maybeSingle();
 
   if (user) {
-    ctx.reply(`Рад видеть вас снова, ${user.name}!`, getMainMenu());
+    let welcomeText = `Рад видеть вас снова, ${user.name}!`;
+    if (isStaff(user.role)) welcomeText += ` 👑 (Доступен режим управления)`;
+    ctx.reply(welcomeText, getMainMenu());
   } else {
     ctx.reply(
       'Привет! Для работы с ботом необходимо зафиксировать Ваше имя в системе.',
@@ -79,44 +66,34 @@ bot.start(async (ctx) => {
   }
 });
 
-// Кнопка автоматической регистрации
 bot.action('auto_register', async (ctx) => {
   const userId = ctx.from.id.toString(); 
   const formattedName = formatTelegramName(ctx.from);
 
-  // Сначала проверяем, вдруг юзер уже есть
   const { data: existingUser } = await supabase.from('users').select('id').eq('id', userId).maybeSingle();
-
   if (existingUser) {
-    ctx.answerCbQuery('Вы уже были зарегистрированы!');
-    return ctx.reply('Вы уже в системе. Используйте меню:', getMainMenu());
+    ctx.answerCbQuery('Вы уже зарегистрированы!');
+    return ctx.reply('Вы уже в системе.', getMainMenu());
   }
 
-  // Если нет — жестко инсертим
-  const { error } = await supabase.from('users').insert({ id: userId, name: formattedName });
-
-  if (error) {
-    // Если Supabase выдаст ошибку, бот напишет её прямо в чат, и мы поймем в чем дело
-    return ctx.reply(`Ошибка базы данных при регистрации: ${error.message}\nКод: ${error.code}`);
-  }
+  const { error } = await supabase.from('users').insert({ id: userId, name: formattedName, role: 'user' });
+  if (error) return ctx.reply(`Ошибка регистрации: ${error.message}`);
 
   ctx.answerCbQuery('Регистрация успешна! 🎉');
   ctx.editMessageText(`Вы зарегистрированы как: *${formattedName}*.`, { parse_mode: 'Markdown' });
   ctx.reply('Используйте меню ниже:', getMainMenu());
 });
 
-// Просмотр общего расписания по отделам
+// Просмотр расписания обедов
 bot.hears('📊 Посмотреть все отделы', async (ctx) => {
   const { data: dbBookings } = await supabase.from('bookings').select('*');
   let response = '📋 *Текущая очередь по отделам:*\n\n';
 
   for (const [groupName, deps] of Object.entries(departmentGroups)) {
     response += `📦 *${groupName.toUpperCase()}*\n— — — — — — — — — — — — —\n`;
-    
     timeSlots.forEach(slot => {
       let slotHasBookings = false;
       let slotText = `⏰ *${slot.split(' ')[0]}*:\n`;
-      
       deps.forEach(dep => {
         const matches = dbBookings?.filter(b => b.department === dep && b.time_slot === slot) || [];
         if (matches.length > 0) {
@@ -131,52 +108,104 @@ bot.hears('📊 Посмотреть все отделы', async (ctx) => {
   ctx.replyWithMarkdown(response);
 });
 
-// Просмотр дежурных на неделю
+// Просмотр дежурных (с разделением по отделам)
 bot.hears('📅 Дежурные на неделю', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
   const { data: duties } = await supabase.from('duty').select('*');
-  let text = '📋 *График дежурных на неделю:*\n\n';
-  const buttons = [];
 
+  let text = '📋 *График дежурных на неделю (по отделам):*\n\n';
+  
   daysOfWeek.forEach(day => {
-    const d = duties?.find(item => item.day_of_week === day);
-    const name = d && d.duty_name ? d.duty_name : 'Не назначен 🤷‍♂️';
-    text += `🔹 *${day}*: ${name}\n`;
-    buttons.push([Markup.button.callback(`Изменить ${day}`, `edit_duty_${day}`)]);
+    text += `📅 *${day}:*\n`;
+    const dayDuties = duties?.filter(d => d.day_of_week === day) || [];
+    
+    allDepartments.forEach(dep => {
+      const dutyForDep = dayDuties.find(d => d.department === dep);
+      const name = dutyForDep ? dutyForDep.duty_name : 'Не назначен 🤷‍♂️';
+      text += `  └ *${dep}*: ${name}\n`;
+    });
+    text += '\n';
   });
 
-  ctx.replyWithMarkdown(text, Markup.inlineKeyboard(buttons));
+  // Кнопки изменения доступны ТОЛЬКО для admin и manager
+  if (me && isStaff(me.role)) {
+    const buttons = daysOfWeek.map(day => [Markup.button.callback(`⚙️ Изменить: ${day}`, `staff_day_${day}`)]);
+    ctx.replyWithMarkdown(text, Markup.inlineKeyboard(buttons));
+  } else {
+    ctx.replyWithMarkdown(text);
+  }
 });
 
-// Назначение себя дежурным на определенный день + автооповещение
-bot.action(/^edit_duty_(.+)$/, async (ctx) => {
+// Админ-выбор дня для назначения дежурного
+bot.action(/^staff_day_(.+)$/, async (ctx) => {
   const day = ctx.match[1];
-  const userId = ctx.from.id.toString(); 
-  
-  const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
-  const savedName = user ? user.name : formatTelegramName(ctx.from);
-
-  await supabase.from('duty').update({ duty_name: savedName }).eq('day_of_week', day);
-
-  ctx.answerCbQuery(`Вы назначены дежурным на ${day}!`);
-  ctx.editMessageText(`Вы успешно записались дежурным на *${day}*! Команда получила уведомление.`, { parse_mode: 'Markdown' });
-
-  await notifyAllUsers(`🔔 *Обновление графика!* \n\n👤 *${savedName}* назначен дежурным на *${day}*.`, userId);
+  const buttons = allDepartments.map(dep => [Markup.button.callback(`Отдел: ${dep}`, `staff_dep_${day}_${dep}`)]);
+  ctx.editMessageText(`Управление дежурными на *${day}*.\nВыберите отдел для назначения:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
-// Шаг 1 бронирования lunch-слота: выбор отдела
+// Админ-выбор сотрудника для назначения дежурным
+bot.action(/^staff_dep_(.+)_(.+)$/, async (ctx) => {
+  const day = ctx.match[1];
+  const dep = ctx.match[2];
+
+  // Достаем ВСЕХ пользователей, чтобы админ выбрал кого назначить
+  const { data: allUsers } = await supabase.from('users').select('id, name');
+  
+  if (!allUsers || allUsers.length === 0) {
+    return ctx.answerCbQuery('Нет зарегистрированных сотрудников!', { show_alert: true });
+  }
+
+  const buttons = allUsers.map(u => [Markup.button.callback(u.name, `assign_duty_${day}_${dep}_${u.id}`)]);
+  buttons.push([Markup.button.callback('❌ Сбросить дежурного', `assign_duty_${day}_${dep}_clear`)]);
+
+  ctx.editMessageText(`Назначаем дежурного в отдел *${dep}* на *${day}*.\nВыберите сотрудника:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+});
+
+// Финал назначения дежурного в базу
+bot.action(/^assign_duty_(.+)_(.+)_(.+)$/, async (ctx) => {
+  const day = ctx.match[1];
+  const dep = ctx.match[2];
+  const targetUserId = ctx.match[3];
+
+  // Сначала удаляем старого дежурного на этот день в этом отделе
+  await supabase.from('duty').delete().eq('day_of_week', day).eq('department', dep);
+
+  if (targetUserId === 'clear') {
+    ctx.answerCbQuery('Дежурный сброшен');
+    return ctx.editMessageText(`Дежурный на *${day}* в отделе *${dep}* успешно сброшен.`, { parse_mode: 'Markdown' });
+  }
+
+  const { data: targetUser } = await supabase.from('users').select('name').eq('id', targetUserId).maybeSingle();
+  if (!targetUser) return ctx.answerCbQuery('Пользователь не найден');
+
+  // Вставляем новую запись
+  await supabase.from('duty').insert({
+    day_of_week: day,
+    department: dep,
+    duty_name: targetUser.name,
+    user_id: targetUserId
+  });
+
+  ctx.answerCbQuery(`Назначен: ${targetUser.name}`);
+  ctx.editMessageText(`На *${day}* в отдел *${dep}* дежурным успешно назначен *${targetUser.name}*!`, { parse_mode: 'Markdown' });
+  
+  // Личное моментальное уведомление человеку
+  try {
+    await bot.telegram.sendMessage(targetUserId, `🔔 Вас назначили дежурным на *${day}* в отдел *${dep}*!`, { parse_mode: 'Markdown' });
+  } catch (e) {}
+});
+
+// --- ЛОГИКА БРОНИРОВАНИЯ ОБЕДОВ (БЕЗ ИЗМЕНЕНИЙ) ---
 bot.hears('🙋 Забронировать место', async (ctx) => {
   const userId = ctx.from.id.toString(); 
   const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
-  
-  if (!user) {
-    return ctx.reply('Сначала зарегистрируйтесь! Наберите команду /start и нажмите кнопку регистрации.');
-  }
+  if (!user) return ctx.reply('Сначала зарегистрируйтесь!');
 
   const buttons = allDepartments.map(dep => [Markup.button.callback(dep, `select_dep_${dep}`)]);
   ctx.reply('Выберите ваш отдел:', Markup.inlineKeyboard(buttons));
 });
 
-// Шаг 2 бронирования lunch-слота: выбор доступного времени
 bot.action(/^select_dep_(.+)$/, (ctx) => {
   const dep = ctx.match[1];
   const buttons = [];
@@ -189,7 +218,6 @@ bot.action(/^select_dep_(.+)$/, (ctx) => {
   ctx.editMessageText(`Отдел *${dep}*. Выберите время:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
-// Шаг 3 бронирования lunch-слота: запись в Supabase
 bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
   const dep = ctx.match[1];
   const slotIndex = parseInt(ctx.match[2]);
@@ -211,27 +239,86 @@ bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
   ctx.editMessageText(`Вы записаны в отдел *${dep}* на *${slot}*.`, { parse_mode: 'Markdown' });
 });
 
-// Отмена всех броней текущего пользователя
 bot.hears('❌ Отменить мою бронь', async (ctx) => {
   const userId = ctx.from.id.toString(); 
   const { error } = await supabase.from('bookings').delete().eq('user_id', userId);
-
-  if (!error) {
-    ctx.reply('Все ваши бронирования во всех отделах успешно отменены.', getMainMenu());
-  } else {
-    ctx.reply('Активных броней не найдено.', getMainMenu());
-  }
+  ctx.reply(error ? 'Активных броней не найдено.' : 'Все ваши бронирования успешно отменены.', getMainMenu());
 });
 
+
+// ==========================================
+// СЛУЖЕБНЫЕ СКРИПТЫ ДЛЯ АВТО-УВЕДОМЛЕНИЙ (CRON JOBS)
+// ==========================================
+
+const handleMorningDutyCron = async () => {
+  const days = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
+  const todayName = days[new Date().getDay()]; // Получаем текущий день недели
+
+  // Тянем всех дежурных на сегодня
+  const { data: todayDuties } = await supabase.from('duty').select('*').eq('day_of_week', todayName);
+  if (!todayDuties || todayDuties.length === 0) return;
+
+  for (const duty of todayDuties) {
+    try {
+      await bot.telegram.sendMessage(
+        duty.user_id, 
+        `☀️ *Доброе утро!* Напоминаем, что сегодня ты назначен дежурным в отдел *${duty.department}*. Удачной смены!`, 
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      console.log(`Не удалось отправить утреннее уведомление для ${duty.user_id}`);
+    }
+  }
+};
+
+const handleLunchReminderCron = async () => {
+  // Вычисляем время, которое наступит через 15 минут
+  const futureTime = new Date(Date.now() + 15 * 60 * 1000);
+  const hours = String(futureTime.getHours()).padStart(2, '0');
+  const minutes = String(futureTime.getMinutes()).padStart(2, '0');
+  const targetTimeStr = `${hours}:${minutes}`; // Получаем строку вида "12:30"
+
+  const { data: allBookings } = await supabase.from('bookings').select('*');
+  if (!allBookings) return;
+
+  // Ищем брони, у которых время совпадает с targetTimeStr
+  const matchingBookings = allBookings.filter(b => b.time_slot.startsWith(targetTimeStr));
+
+  for (const booking of matchingBookings) {
+    try {
+      await bot.telegram.sendMessage(
+        booking.user_id,
+        `⏳ *Напоминание за 15 минут!* Скоро твое время обеда/завтрака:\n📍 Отдел: *${booking.department}*\n⏰ Время: *${booking.time_slot}*`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      console.log(`Не удалось напомнить пользователю ${booking.user_id}`);
+    }
+  }
+};
+
+// Главный обработчик сервера Vercel
 module.exports = async (req, res) => {
   try {
+    // Если запрос пришел по вебхуку от Telegram
     if (req.method === 'POST') {
       await bot.handleUpdate(req.body, res);
-    } else {
-      res.status(200).send('Бот на Supabase работает!');
+    } 
+    // Если запрос пришел от планировщика Vercel Cron (Утренние дежурные)
+    else if (req.query.cron === 'morning') {
+      await handleMorningDutyCron();
+      res.status(200).send('Morning cron executed successfully');
+    } 
+    // Если запрос пришел от планировщика Vercel Cron (Обеды за 15 минут)
+    else if (req.query.cron === 'lunch') {
+      await handleLunchReminderCron();
+      res.status(200).send('Lunch cron executed successfully');
+    } 
+    else {
+      res.status(200).send('Бот на Supabase работает стабильно!');
     }
   } catch (error) {
-    console.error('Ошибка обработки хука:', error);
+    console.error('Ошибка обработки:', error);
     res.status(500).send('Внутренняя ошибка сервера');
   }
 };
