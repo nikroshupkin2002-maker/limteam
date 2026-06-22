@@ -1,0 +1,9 @@
+{
+  "name": "tg-lunch-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for booking lunch slots",
+  "main": "api/webhook.js",
+  "dependencies": {
+    "telegraf": "^4.16.3"
+  }
+}
