@@ -50,12 +50,11 @@ const formatTelegramName = (from) => {
 
 // Функция массовой автоматической рассылки уведомлений всей команде
 const notifyAllUsers = async (textMessage, excludeUserId) => {
-  // Вытаскиваем все ID зарегистрированных пользователей из Supabase
   const { data: users } = await supabase.from('users').select('id');
   if (!users) return;
 
   for (const user of users) {
-    if (user.id === excludeUserId) continue; // Пропускаем того, кто сделал изменения
+    if (user.id === excludeUserId) continue; // Пропускаем автора изменений
     try {
       await bot.telegram.sendMessage(user.id, textMessage, { parse_mode: 'Markdown' });
     } catch (err) {
@@ -66,10 +65,9 @@ const notifyAllUsers = async (textMessage, excludeUserId) => {
 
 // Команда /start
 bot.start(async (ctx) => {
-  const userId = ctx.from.id;
+  const userId = ctx.from.id.toString(); // Превращаем ID в текст для базы данных
   
-  // Используем .maybeSingle() вместо .single(), чтобы код не падал, если юзера нет в базе
-  const { data: user, error } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
+  const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
 
   if (user) {
     ctx.reply(`Рад видеть вас снова, ${user.name}!`, getMainMenu());
@@ -83,10 +81,10 @@ bot.start(async (ctx) => {
 
 // Кнопка автоматической регистрации
 bot.action('auto_register', async (ctx) => {
-  const userId = ctx.from.id;
+  const userId = ctx.from.id.toString(); // Превращаем ID в текст для базы данных
   const formattedName = formatTelegramName(ctx.from);
 
-  // Сохраняем или обновляем пользователя в таблице users
+  // Сохраняем пользователя в таблице users
   await supabase.from('users').upsert({ id: userId, name: formattedName });
 
   ctx.answerCbQuery('Регистрация успешна! 🎉');
@@ -139,7 +137,7 @@ bot.hears('📅 Дежурные на неделю', async (ctx) => {
 // Назначение себя дежурным на определенный день + автооповещение
 bot.action(/^edit_duty_(.+)$/, async (ctx) => {
   const day = ctx.match[1];
-  const userId = ctx.from.id;
+  const userId = ctx.from.id.toString(); // Превращаем ID в текст
   
   const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
   const savedName = user ? user.name : formatTelegramName(ctx.from);
@@ -150,13 +148,13 @@ bot.action(/^edit_duty_(.+)$/, async (ctx) => {
   ctx.answerCbQuery(`Вы назначены дежурным на ${day}!`);
   ctx.editMessageText(`Вы успешно записались дежурным на *${day}*! Команда получила уведомление.`, { parse_mode: 'Markdown' });
 
-  // Запуск рассылки: бот сам отправляет сообщение всем подключенным коллегам
+  // Запуск рассылки всей команде
   await notifyAllUsers(`🔔 *Обновление графика!* \n\n👤 *${savedName}* назначен дежурным на *${day}*.`, userId);
 });
 
 // Шаг 1 бронирования lunch-слота: выбор отдела
 bot.hears('🙋 Забронировать место', async (ctx) => {
-  const userId = ctx.from.id;
+  const userId = ctx.from.id.toString(); // Превращаем ID в текст
   const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
   if (!user) return ctx.reply('Сначала зарегистрируйтесь через верхнюю кнопку!');
 
@@ -182,7 +180,7 @@ bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
   const dep = ctx.match[1];
   const slotIndex = parseInt(ctx.match[2]);
   const slot = timeSlots[slotIndex];
-  const userId = ctx.from.id;
+  const userId = ctx.from.id.toString(); // Превращаем ID в текст
 
   const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
   const userName = user ? user.name : formatTelegramName(ctx.from);
@@ -205,7 +203,7 @@ bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
 
 // Отмена всех броней текущего пользователя
 bot.hears('❌ Отменить мою бронь', async (ctx) => {
-  const userId = ctx.from.id;
+  const userId = ctx.from.id.toString(); // Превращаем ID в текст
   const { error } = await supabase.from('bookings').delete().eq('user_id', userId);
 
   if (!error) {
@@ -228,4 +226,3 @@ module.exports = async (req, res) => {
     res.status(500).send('Внутренняя ошибка сервера');
   }
 };
- 
