@@ -2,11 +2,5 @@
   "version": 2,
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/webhook" }
-  ],
-  "crons": [
-    {
-      "path": "/api/webhook?cron=check",
-      "schedule": "0 * * * *"
-    }
   ]
 }
