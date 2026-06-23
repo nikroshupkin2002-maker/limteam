@@ -4,7 +4,7 @@ const { createClient } = require('@supabase/supabase-js');
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 // Группы отделов для очереди обедов
 const departmentGroups = {
@@ -169,14 +169,15 @@ bot.action('auto_register', async (ctx) => {
 
 // 1. ОЧЕРЕДЬ ОБЕДОВ (бронирования не зависят от даты — это очередь на сегодняшний день по смыслу использования)
 bot.hears('📊 Завтрак и Обед по отделам', async (ctx) => {
-  const { data: dbBookings, error } = await supabase.from('bookings').select('*');
+  const today = getTodayISO();
+  const { data: dbBookings, error } = await supabase.from('bookings').select('*').eq('booking_date', today);
 
   if (error) {
     console.error('Ошибка получения бронирований:', error);
     return ctx.reply('⚠️ Не удалось загрузить данные. Попробуйте позже.');
   }
 
-  let response = '📋 *Текущая очередь по отделам:*\n\n';
+  let response = '📋 *Текущая очередь по отделам (на сегодня):*\n\n';
 
   for (const [groupName, deps] of Object.entries(departmentGroups)) {
     response += `📦 *${groupName.toUpperCase()}*\n— — — — — — — — — — — — —\n`;
@@ -556,51 +557,79 @@ bot.action(/^task_done_(.+)$/, async (ctx) => {
 // ==========================================
 
 // Сопоставление написанного имени с реальным пользователем из базы (без учёта регистра, по подстроке)
+// Нечёткое сопоставление написанного имени с реальным пользователем из базы.
+// Сначала точное совпадение, потом по первому слову (имени), потом по подстроке.
 const matchUserByName = (writtenName, allUsers) => {
-  const normalized = writtenName.trim().toLowerCase();
+  const normalized = (writtenName || '').trim().toLowerCase();
+  if (!normalized) return null;
+
   let best = allUsers.find(u => u.name.toLowerCase() === normalized);
   if (best) return best;
+
+  const firstWord = normalized.split(/\s+/)[0];
+  best = allUsers.find(u => u.name.toLowerCase().split(/\s+/)[0] === firstWord);
+  if (best) return best;
+
   best = allUsers.find(u => u.name.toLowerCase().includes(normalized) || normalized.includes(u.name.toLowerCase()));
   return best || null;
 };
 
-const callGemini = async (userText, weekDates) => {
-  const weekInfo = weekDates.map(d => `${d} (${getDayFullByDate(d)})`).join(', ');
-  const prompt = `Ты помощник, который превращает свободный текст о графике работы или дежурствах в JSON.
-Доступные отделы: ${allDepartments.join(', ')}.
-Даты текущей недели: ${weekInfo}.
-Если в тексте упомянут день недели без даты — определи дату из списка выше.
-Если дата/день не указаны явно — считай, что речь про сегодня: ${getTodayISO()}.
+const callGemini = async (userText, weekDates, allUsers) => {
+  const weekInfo = weekDates.map(d => `${d} (${getDayFullByDate(d)}, короткое: ${getDayShortByDate(d)})`).join('; ');
+  const namesList = (allUsers || []).map(u => u.name).join(', ');
 
-Верни СТРОГО JSON без markdown и пояснений, формат:
-{"entries": [{"date": "YYYY-MM-DD", "department": "название отдела", "worker": "имя сотрудника", "is_duty": true|false}]}
+  const prompt = `Ты — ассистент магазина, который превращает свободную фразу сотрудника о графике работы или дежурствах в структурированный JSON.
 
-is_duty = true если человек назначается ДЕЖУРНЫМ (слова "дежурный", "дежурит"), иначе false (обычный график работы).
-Если в тексте несколько человек на один отдел/дату — верни несколько записей entries.
-Если не можешь понять текст — верни {"entries": []}.
+КОНТЕКСТ:
+- Сегодняшняя дата: ${getTodayISO()}.
+- Даты текущей недели (Пн-Нд): ${weekInfo}.
+- Список отделов магазина: ${allDepartments.join(', ')}.
+- Реальные сотрудники, зарегистрированные в системе: ${namesList || 'список пуст'}.
 
-Текст пользователя: "${userText}"`;
+ЗАДАЧА:
+Прочитай фразу пользователя (она может быть написана разговорно, с опечатками, на русском или транслитом, без строгой структуры) и пойми:
+- о ком идёт речь (сопоставь с именем из списка сотрудников выше, даже если написано неполно, с опечаткой или транслитом — например "Vlada" это "Влада", "вася ж" может быть "Василий Ж." и т.п. Выбери максимально похожее имя из списка),
+- на какую дату (если сказано "завтра", "сегодня", день недели — вычисли точную дату из списка дат недели выше),
+- в какой отдел (сопоставь даже неполное/с ошибкой название с одним из отделов списка, например "уатлет" = "Аутлет"),
+- идёт ли речь о ДЕЖУРСТВЕ (слова: дежурный, дежурит, дежурство) или об обычном графике РАБОТЫ (по умолчанию, если дежурство не упомянуто явно).
 
-  const response = await fetch(GEMINI_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-  });
+Если в одной фразе человек и работает, и дежурит на одном месте — верни ДВЕ записи (одну с is_duty:false, другую с is_duty:true).
+Если упомянуто несколько человек — верни запись на каждого.
+
+Верни ОТВЕТ СТРОГО В ФОРМАТЕ JSON, без markdown-обёртки, без пояснений до или после:
+{"entries": [{"date": "YYYY-MM-DD", "department": "точное название отдела из списка", "worker": "точное имя из списка сотрудников", "is_duty": true|false}]}
+
+Если фразу совсем невозможно понять — верни {"entries": []}.
+
+Фраза пользователя: "${userText}"`;
+
+  let response;
+  try {
+    response = await fetch(GEMINI_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+    });
+  } catch (e) {
+    console.error('Сетевая ошибка запроса к Gemini:', e);
+    return null;
+  }
 
   if (!response.ok) {
     const errText = await response.text();
-    console.error('Ошибка Gemini API:', errText);
+    console.error('Ошибка Gemini API, статус:', response.status, 'тело:', errText);
     return null;
   }
 
   const data = await response.json();
   let raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  console.log('Сырой ответ Gemini:', raw);
   raw = raw.replace(/```json|```/g, '').trim();
 
   try {
     return JSON.parse(raw);
   } catch (e) {
-    console.error('Не удалось распарсить ответ Gemini:', raw);
+    console.error('Не удалось распарсить ответ Gemini как JSON. Сырой текст:', raw);
     return null;
   }
 };
@@ -687,11 +716,12 @@ bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
   const slotIndex = parseInt(ctx.match[2]);
   const slot = timeSlots[slotIndex];
   const userId = ctx.from.id.toString();
+  const today = getTodayISO();
 
   const { data: userRow } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
   const userName = userRow?.name || formatTelegramName(ctx.from);
 
-  const { data: checkDep, error: checkError } = await supabase.from('bookings').select('*').eq('department', dep).eq('time_slot', slot);
+  const { data: checkDep, error: checkError } = await supabase.from('bookings').select('*').eq('department', dep).eq('time_slot', slot).eq('booking_date', today);
 
   if (checkError) {
     console.error('Ошибка проверки слота:', checkError);
@@ -702,26 +732,27 @@ bot.action(/^book_(.+)_(.+)$/, async (ctx) => {
     return ctx.answerCbQuery(`Слот уже занят сотрудником ${checkDep[0].user_name}!`, { show_alert: true });
   }
 
-  const { error: deleteError } = await supabase.from('bookings').delete().eq('user_id', userId).eq('department', dep);
+  const { error: deleteError } = await supabase.from('bookings').delete().eq('user_id', userId).eq('department', dep).eq('booking_date', today);
   if (deleteError) {
     console.error('Ошибка очистки старой брони:', deleteError);
     return ctx.answerCbQuery('⚠️ Ошибка записи. Попробуйте позже.', { show_alert: true });
   }
 
-  const { error: insertError } = await supabase.from('bookings').insert({ user_id: userId, department: dep, time_slot: slot, user_name: userName });
+  const { error: insertError } = await supabase.from('bookings').insert({ user_id: userId, department: dep, time_slot: slot, user_name: userName, booking_date: today });
   if (insertError) {
     console.error('Ошибка создания брони:', insertError);
     return ctx.answerCbQuery('⚠️ Не удалось записаться. Попробуйте позже.', { show_alert: true });
   }
 
   ctx.answerCbQuery(`Успешно записаны! 🎉`);
-  ctx.editMessageText(`Вы записаны в отдел *${dep}* на *${slot}*.`, { parse_mode: 'Markdown' });
+  ctx.editMessageText(`Вы записаны в отдел *${dep}* на *${slot}* (на сегодня).`, { parse_mode: 'Markdown' });
 });
 
 bot.hears('❌ Отменить мою бронь', async (ctx) => {
   const userId = ctx.from.id.toString();
-  const { error } = await supabase.from('bookings').delete().eq('user_id', userId);
-  ctx.reply(error ? 'Активных броней не найдено.' : 'Все ваши бронирования успешно отменены.', getMainMenu());
+  const today = getTodayISO();
+  const { error } = await supabase.from('bookings').delete().eq('user_id', userId).eq('booking_date', today);
+  ctx.reply(error ? 'Активных броней на сегодня не найдено.' : 'Ваша бронь на сегодня отменена.', getMainMenu());
 });
 
 // ==========================================
@@ -741,13 +772,13 @@ bot.on('text', async (ctx) => {
     const weekDates = getCurrentWeekDates();
 
     const waitMsg = await ctx.reply('🤖 Думаю...');
-    const result = await callGemini(ctx.message.text, weekDates);
+    const { data: allUsers } = await supabase.from('users').select('id, name');
+    const result = await callGemini(ctx.message.text, weekDates, allUsers);
 
     if (!result || !result.entries || result.entries.length === 0) {
-      return ctx.reply('⚠️ Не удалось понять текст. Попробуйте переформулировать, например: "завтра Вася Ж на обуви".');
+      return ctx.reply('⚠️ Не удалось понять текст. Попробуйте переформулировать, например: "завтра Вася Ж на обуви".\n\nЕсли проблема повторяется — проверьте логи Vercel (там будет точная причина).');
     }
 
-    const { data: allUsers } = await supabase.from('users').select('id, name');
     const resolvedEntries = [];
     const problems = [];
 
