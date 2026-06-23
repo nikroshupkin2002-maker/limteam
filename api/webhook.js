@@ -8,6 +8,13 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODELS = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
 const geminiUrl = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
 
+// Твой личный Telegram ID — только этот аккаунт может менять права доступа других людей
+const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_ID;
+
+// Версия бота — меняй строку при каждом значимом обновлении кода/кнопок,
+// чтобы бот сам предлагал пользователям нажать /start для обновления меню
+const BOT_VERSION = '2026-06-25-1';
+
 // Группы отделов для очереди обедов
 const departmentGroups = {
   "Группа (Аутлет, Обувь, Альпинизм)": ["Аутлет", "Обувь", "Альпинизм"],
@@ -42,7 +49,7 @@ const generateTimeSlots = () => {
 const timeSlots = generateTimeSlots();
 
 // Главное меню с новыми кнопками
-const getMainMenu = (staff = false) => {
+const getMainMenu = (staff = false, isSuper = false) => {
   const rows = [
     ['📊 Завтрак и Обед по отделам', '📅 Дежурные на неделю'],
     ['🔥 Дежурные на сегодня', '📆 График на сегодня'],
@@ -51,6 +58,7 @@ const getMainMenu = (staff = false) => {
   ];
   if (staff) rows.push(['📌 Поставить задачу', '📋 Задачи команды']);
   if (staff) rows.push(['🤖 Написать график текстом']);
+  if (isSuper) rows.push(['🔑 Управление доступом']);
   return Markup.keyboard(rows).resize();
 };
 
@@ -128,6 +136,28 @@ const codeToDate = (code, isoDate) => {
   return `${year}-${code.slice(0, 2)}-${code.slice(2, 4)}`;
 };
 
+// ==========================================
+// MIDDLEWARE: проверка версии бота — если код обновился, просим нажать /start
+// ==========================================
+
+bot.use(async (ctx, next) => {
+  // Не мешаем самой команде /start и не трогаем неизвестные типы обновлений без текста/действия
+  const isStartCommand = ctx.message?.text === '/start';
+
+  if (!isStartCommand && ctx.from) {
+    const userId = ctx.from.id.toString();
+    const { data: user } = await supabase.from('users').select('seen_version').eq('id', userId).maybeSingle();
+
+    if (user && user.seen_version !== BOT_VERSION) {
+      // Обновляем версию сразу, чтобы напоминание не дублировалось на каждое сообщение
+      await supabase.from('users').update({ seen_version: BOT_VERSION }).eq('id', userId);
+      await ctx.reply('🔄 Бот был обновлён! Нажмите /start, чтобы обновить меню и кнопки.');
+    }
+  }
+
+  return next();
+});
+
 // Команда /start
 bot.start(async (ctx) => {
   const userId = ctx.from.id.toString();
@@ -139,9 +169,10 @@ bot.start(async (ctx) => {
   }
 
   if (user) {
+    await supabase.from('users').update({ seen_version: BOT_VERSION }).eq('id', userId);
     let welcomeText = `Рад видеть вас снова, ${user.name}!`;
     if (isStaff(user.role)) welcomeText += ` 👑 (Администратор)`;
-    ctx.reply(welcomeText, getMainMenu(isStaff(user.role)));
+    ctx.reply(welcomeText, getMainMenu(isStaff(user.role), SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString()));
   } else {
     ctx.reply(
       'Привет! Для работы с ботом необходимо зафиксировать Ваше имя в системе.',
@@ -157,7 +188,7 @@ bot.action('auto_register', async (ctx) => {
   const { data: existingUser } = await supabase.from('users').select('id').eq('id', userId).maybeSingle();
   if (existingUser) return ctx.answerCbQuery('Вы уже зарегистрированы!');
 
-  const { error } = await supabase.from('users').insert({ id: userId, name: formattedName, role: 'user' });
+  const { error } = await supabase.from('users').insert({ id: userId, name: formattedName, role: 'user', seen_version: BOT_VERSION });
 
   if (error) {
     console.error('Ошибка регистрации:', error);
@@ -479,6 +510,82 @@ bot.action(/^duty_toggle_(\d{4})_(.+)_(.+)$/, async (ctx) => {
 
 
 // ==========================================
+// УПРАВЛЕНИЕ ДОСТУПОМ К АДМИНКЕ (только SUPER_ADMIN_ID)
+// ==========================================
+
+const isSuperAdmin = (ctx) => SUPER_ADMIN_ID && ctx.from.id.toString() === SUPER_ADMIN_ID.toString();
+
+bot.hears('🔑 Управление доступом', async (ctx) => {
+  if (!isSuperAdmin(ctx)) return; // молча игнорируем — кнопка и так не видна остальным, но проверяем на всякий случай
+
+  const { data: allUsers, error } = await supabase.from('users').select('id, name, role').neq('id', SUPER_ADMIN_ID);
+  if (error) {
+    console.error('Ошибка получения пользователей:', error);
+    return ctx.reply('⚠️ Не удалось загрузить список пользователей.');
+  }
+  if (!allUsers || allUsers.length === 0) return ctx.reply('Нет других пользователей в базе.');
+
+  const buttons = allUsers.map(u => {
+    const roleLabel = u.role === 'manager' ? '👑' : (u.role === 'admin' ? '🛡️' : '👤');
+    return [Markup.button.callback(`${roleLabel} ${u.name}`, `role_menu_${u.id}`)];
+  });
+  ctx.reply('Выберите сотрудника для изменения прав доступа:', Markup.inlineKeyboard(buttons));
+});
+
+bot.action(/^role_menu_(.+)$/, async (ctx) => {
+  if (!isSuperAdmin(ctx)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+
+  const targetId = ctx.match[1];
+  const { data: targetUser } = await supabase.from('users').select('name, role').eq('id', targetId).maybeSingle();
+  if (!targetUser) return ctx.answerCbQuery('Пользователь не найден', { show_alert: true });
+
+  ctx.editMessageText(
+    `Сотрудник: *${targetUser.name}*\nТекущая роль: *${targetUser.role}*\n\nВыберите новую роль:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('👤 Обычный сотрудник (user)', `role_set_${targetId}_user`)],
+        [Markup.button.callback('🛡️ Админ (admin)', `role_set_${targetId}_admin`)],
+        [Markup.button.callback('👑 Менеджер (manager)', `role_set_${targetId}_manager`)],
+        [Markup.button.callback('⬅️ Назад', 'role_back')]
+      ])
+    }
+  );
+});
+
+bot.action('role_back', async (ctx) => {
+  if (!isSuperAdmin(ctx)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+  ctx.answerCbQuery();
+  const { data: allUsers } = await supabase.from('users').select('id, name, role').neq('id', SUPER_ADMIN_ID);
+  const buttons = (allUsers || []).map(u => {
+    const roleLabel = u.role === 'manager' ? '👑' : (u.role === 'admin' ? '🛡️' : '👤');
+    return [Markup.button.callback(`${roleLabel} ${u.name}`, `role_menu_${u.id}`)];
+  });
+  ctx.editMessageText('Выберите сотрудника для изменения прав доступа:', Markup.inlineKeyboard(buttons));
+});
+
+bot.action(/^role_set_(.+)_(user|admin|manager)$/, async (ctx) => {
+  if (!isSuperAdmin(ctx)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+
+  const targetId = ctx.match[1];
+  const newRole = ctx.match[2];
+
+  const { data: targetUser, error } = await supabase.from('users').update({ role: newRole }).eq('id', targetId).select('name').maybeSingle();
+  if (error || !targetUser) {
+    console.error('Ошибка изменения роли:', error);
+    return ctx.answerCbQuery('⚠️ Не удалось изменить роль', { show_alert: true });
+  }
+
+  ctx.answerCbQuery(`Роль обновлена: ${newRole}`);
+  ctx.editMessageText(`✅ ${targetUser.name} теперь: *${newRole}*.`, { parse_mode: 'Markdown' });
+
+  try {
+    await bot.telegram.sendMessage(targetId, `🔔 Ваши права доступа были изменены. Нажмите /start, чтобы обновить меню.`);
+  } catch (e) {}
+});
+
+
+// ==========================================
 // ЗАДАЧИ СОТРУДНИКАМ
 // ==========================================
 
@@ -593,13 +700,14 @@ const callGemini = async (userText, weekDates, allUsers) => {
 - о ком идёт речь (сопоставь с именем из списка сотрудников выше, даже если написано неполно, с опечаткой или транслитом — например "Vlada" это "Влада", "вася ж" может быть "Василий Ж." и т.п. Выбери максимально похожее имя из списка),
 - на какую дату (если сказано "завтра", "сегодня", день недели — вычисли точную дату из списка дат недели выше),
 - в какой отдел (сопоставь даже неполное/с ошибкой название с одним из отделов списка, например "уатлет" = "Аутлет"),
-- идёт ли речь о ДЕЖУРСТВЕ (слова: дежурный, дежурит, дежурство) или об обычном графике РАБОТЫ (по умолчанию, если дежурство не упомянуто явно).
+- идёт ли речь о ДЕЖУРСТВЕ (слова: дежурный, дежурит, дежурство) или об обычном графике РАБОТЫ (по умолчанию, если дежурство не упомянуто явно),
+- нужно ли ДОБАВИТЬ человека в график (action: "add", по умолчанию) или УБРАТЬ/УДАЛИТЬ его (action: "remove" — если есть слова "убери", "удали", "снять", "сними", "больше не работает", "отмени").
 
 Если в одной фразе человек и работает, и дежурит на одном месте — верни ДВЕ записи (одну с is_duty:false, другую с is_duty:true).
 Если упомянуто несколько человек — верни запись на каждого.
 
 Верни ОТВЕТ СТРОГО В ФОРМАТЕ JSON, без markdown-обёртки, без пояснений до или после:
-{"entries": [{"date": "YYYY-MM-DD", "department": "точное название отдела из списка", "worker": "точное имя из списка сотрудников", "is_duty": true|false}]}
+{"entries": [{"date": "YYYY-MM-DD", "department": "точное название отдела из списка", "worker": "точное имя из списка сотрудников", "is_duty": true|false, "action": "add"|"remove"}]}
 
 Если фразу совсем невозможно понять — верни {"entries": []}.
 
@@ -667,22 +775,44 @@ bot.hears('🤖 Написать график текстом', async (ctx) => {
   ctx.reply('✏️ Напишите свободным текстом, кто и где работает или дежурит.\nНапример: "завтра Вася Ж на обуви, а Кристина дежурная на кассе"');
 });
 
-// Применяем подтверждённые записи к базе (schedule или duty в зависимости от is_duty)
+// Применяем подтверждённые записи к базе: добавление/удаление в schedule или duty, плюс уведомление сотруднику
 const applyScheduleEntries = async (entries) => {
   let okCount = 0, failCount = 0;
+
   for (const e of entries) {
     const table = e.is_duty ? 'duty' : 'schedule';
+
+    if (e.action === 'remove') {
+      const { error } = await supabase.from(table).delete().eq('work_date', e.date).eq('department', e.department).eq('user_id', e.userId);
+      if (error) { console.error(`Ошибка удаления (${table}):`, error); failCount++; } else { okCount++; }
+      continue;
+    }
+
+    // action === 'add' (по умолчанию)
+    const { data: exist } = await supabase.from(table).select('id').eq('work_date', e.date).eq('department', e.department).eq('user_id', e.userId).maybeSingle();
+    if (exist) { okCount++; continue; } // уже есть точно такая запись — не дублируем
+
     const payload = e.is_duty
       ? { work_date: e.date, day_of_week: getDayFullByDate(e.date), department: e.department, duty_name: e.userName, user_id: e.userId }
       : { user_id: e.userId, user_name: e.userName, work_date: e.date, day_of_week: getDayFullByDate(e.date), department: e.department };
 
-    // Не дублируем запись, если уже есть точно такая же
-    const { data: exist } = await supabase.from(table).select('id').eq('work_date', e.date).eq('department', e.department).eq('user_id', e.userId).maybeSingle();
-    if (exist) { okCount++; continue; }
-
     const { error } = await supabase.from(table).insert(payload);
-    if (error) { console.error(`Ошибка записи (${table}):`, error); failCount++; } else { okCount++; }
+    if (error) { console.error(`Ошибка записи (${table}):`, error); failCount++; continue; }
+    okCount++;
+
+    // Уведомляем сотрудника о новом назначении (и для графика работы, и для дежурства)
+    try {
+      const label = e.is_duty ? 'дежурным' : 'на работу';
+      await bot.telegram.sendMessage(
+        e.userId,
+        `🔔 Вас поставили ${label} на *${getDayFullByDate(e.date)}, ${formatDateShort(e.date)}* в отдел *${e.department}*!`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('Не удалось отправить уведомление сотруднику', e.userId, err);
+    }
   }
+
   return { okCount, failCount };
 };
 
@@ -814,7 +944,7 @@ bot.on('text', async (ctx) => {
       if (!matchedUser) { problems.push(`Не нашёл сотрудника "${e.worker}"`); continue; }
       if (!e.date) { problems.push(`Не указана дата для "${e.worker}"`); continue; }
 
-      resolvedEntries.push({ date: e.date, department: dep, userId: matchedUser.id, userName: matchedUser.name, is_duty: !!e.is_duty });
+      resolvedEntries.push({ date: e.date, department: dep, userId: matchedUser.id, userName: matchedUser.name, is_duty: !!e.is_duty, action: e.action === 'remove' ? 'remove' : 'add' });
     }
 
     if (resolvedEntries.length === 0) {
@@ -823,7 +953,8 @@ bot.on('text', async (ctx) => {
 
     let preview = '🤖 *Я понял так:*\n\n';
     resolvedEntries.forEach(e => {
-      preview += `${e.is_duty ? '🔔 Дежурный' : '👷 Работает'}: *${e.userName}* — *${e.department}*, ${getDayFullByDate(e.date)} ${formatDateShort(e.date)}\n`;
+      const actionLabel = e.action === 'remove' ? '❌ Убрать' : (e.is_duty ? '🔔 Дежурный' : '👷 Работает');
+      preview += `${actionLabel}: *${e.userName}* — *${e.department}*, ${getDayFullByDate(e.date)} ${formatDateShort(e.date)}\n`;
     });
     if (problems.length > 0) preview += `\n⚠️ Не учтено: ${problems.join('; ')}\n`;
     preview += '\nЗаписать в график?';
