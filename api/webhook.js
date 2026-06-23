@@ -38,13 +38,15 @@ const generateTimeSlots = () => {
 const timeSlots = generateTimeSlots();
 
 // Главное меню с новыми кнопками
-const getMainMenu = () => {
-  return Markup.keyboard([
+const getMainMenu = (staff = false) => {
+  const rows = [
     ['📊 Завтрак и Обед по отделам', '📅 Дежурные на неделю'],
     ['🔥 Дежурные на сегодня', '📆 График на сегодня'],
     ['📝 График работы на неделю', '🙋 Бронь Завтрака и обеда'],
     ['❌ Отменить мою бронь']
-  ]).resize();
+  ];
+  if (staff) rows.push(['📌 Поставить задачу', '📋 Задачи команды']);
+  return Markup.keyboard(rows).resize();
 };
 
 const formatTelegramName = (from) => {
@@ -134,7 +136,7 @@ bot.start(async (ctx) => {
   if (user) {
     let welcomeText = `Рад видеть вас снова, ${user.name}!`;
     if (isStaff(user.role)) welcomeText += ` 👑 (Администратор)`;
-    ctx.reply(welcomeText, getMainMenu());
+    ctx.reply(welcomeText, getMainMenu(isStaff(user.role)));
   } else {
     ctx.reply(
       'Привет! Для работы с ботом необходимо зафиксировать Ваше имя в системе.',
@@ -471,6 +473,82 @@ bot.action(/^duty_toggle_(\d{4})_(.+)_(.+)$/, async (ctx) => {
 
 
 // ==========================================
+// ЗАДАЧИ СОТРУДНИКАМ
+// ==========================================
+
+// Сохраняем "что бот ждёт от этого пользователя следующим сообщением"
+const setPendingAction = async (userId, action) => {
+  await supabase.from('users').update({ pending_action: action }).eq('id', userId);
+};
+const clearPendingAction = async (userId) => {
+  await supabase.from('users').update({ pending_action: null }).eq('id', userId);
+};
+
+bot.hears('📌 Поставить задачу', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  if (!me || !isStaff(me.role)) return;
+
+  const { data: allUsers } = await supabase.from('users').select('id, name').neq('id', userId);
+  if (!allUsers || allUsers.length === 0) return ctx.reply('Нет сотрудников в базе.');
+
+  const buttons = allUsers.map(u => [Markup.button.callback(u.name, `task_to_${u.id}`)]);
+  ctx.reply('Кому поставить задачу?', Markup.inlineKeyboard(buttons));
+});
+
+bot.action(/^task_to_(.+)$/, async (ctx) => {
+  const fromId = ctx.from.id.toString();
+  const toId = ctx.match[1];
+
+  await setPendingAction(fromId, JSON.stringify({ type: 'awaiting_task_text', to: toId }));
+  ctx.answerCbQuery();
+  ctx.editMessageText('✏️ Напишите текст задачи в следующем сообщении.');
+});
+
+bot.hears('📋 Задачи команды', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  if (!me || !isStaff(me.role)) return;
+
+  const { data: tasks, error } = await supabase.from('tasks').select('*').order('created_at', { ascending: false }).limit(20);
+  if (error) {
+    console.error('Ошибка получения задач:', error);
+    return ctx.reply('⚠️ Не удалось загрузить задачи.');
+  }
+  if (!tasks || tasks.length === 0) return ctx.reply('Активных задач нет.');
+
+  let text = '📋 *Последние задачи команды:*\n\n';
+  tasks.forEach(t => {
+    const statusIcon = t.status === 'done' ? '✅' : '⏳';
+    text += `${statusIcon} *${t.to_user_name}*: ${t.text}\n`;
+  });
+  ctx.replyWithMarkdown(text);
+});
+
+bot.action(/^task_done_(.+)$/, async (ctx) => {
+  const taskId = ctx.match[1];
+  const { data: task, error: fetchError } = await supabase.from('tasks').select('*').eq('id', taskId).maybeSingle();
+
+  if (fetchError || !task) {
+    return ctx.answerCbQuery('⚠️ Задача не найдена', { show_alert: true });
+  }
+
+  const { error } = await supabase.from('tasks').update({ status: 'done' }).eq('id', taskId);
+  if (error) {
+    console.error('Ошибка отметки задачи:', error);
+    return ctx.answerCbQuery('⚠️ Не удалось отметить задачу', { show_alert: true });
+  }
+
+  ctx.answerCbQuery('Отмечено как выполнено ✅');
+  ctx.editMessageText(`✅ *Выполнено:* ${task.text}`, { parse_mode: 'Markdown' });
+
+  try {
+    await bot.telegram.sendMessage(task.from_user_id, `✅ ${task.to_user_name} выполнил(а) задачу: "${task.text}"`);
+  } catch (e) {}
+});
+
+
+// ==========================================
 // БРОНИРОВАНИЯ (ОБЕДЫ)
 // ==========================================
 
@@ -539,6 +617,53 @@ bot.hears('❌ Отменить мою бронь', async (ctx) => {
   ctx.reply(error ? 'Активных броней не найдено.' : 'Все ваши бронирования успешно отменены.', getMainMenu());
 });
 
+// ==========================================
+// ОБРАБОТКА СВОБОДНОГО ТЕКСТА (должен идти после всех bot.hears)
+// ==========================================
+
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('pending_action').eq('id', userId).maybeSingle();
+  if (!me?.pending_action) return; // нет ожидаемого действия — игнорируем (не наш текст)
+
+  let pending;
+  try { pending = JSON.parse(me.pending_action); } catch (e) { return clearPendingAction(userId); }
+
+  if (pending.type === 'awaiting_task_text') {
+    const taskText = ctx.message.text.trim();
+    const { data: toUser } = await supabase.from('users').select('name').eq('id', pending.to).maybeSingle();
+
+    await clearPendingAction(userId);
+
+    if (!toUser) return ctx.reply('⚠️ Сотрудник не найден, задача не создана.');
+
+    const { data: newTask, error } = await supabase.from('tasks').insert({
+      from_user_id: userId,
+      to_user_id: pending.to,
+      to_user_name: toUser.name,
+      text: taskText,
+      status: 'pending'
+    }).select().single();
+
+    if (error) {
+      console.error('Ошибка создания задачи:', error);
+      return ctx.reply('⚠️ Не удалось создать задачу.');
+    }
+
+    ctx.reply(`✅ Задача поставлена для ${toUser.name}.`);
+
+    try {
+      await bot.telegram.sendMessage(
+        pending.to,
+        `📌 *Новая задача от руководителя:*\n${taskText}`,
+        { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('✅ Готово', `task_done_${newTask.id}`)]]) }
+      );
+    } catch (e) {
+      ctx.reply('⚠️ Задача сохранена, но не удалось отправить уведомление сотруднику.');
+    }
+  }
+});
+
 module.exports = async (req, res) => {
   try {
     if (req.method === 'POST') {
@@ -551,4 +676,3 @@ module.exports = async (req, res) => {
     res.status(500).send('Внутренняя ошибка сервера');
   }
 };
- 
