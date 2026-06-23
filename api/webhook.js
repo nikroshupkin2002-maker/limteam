@@ -14,11 +14,6 @@ const departmentGroups = {
 
 // Все существующие отделы системы
 const allDepartments = ["Аутлет", "Альпинизм", "Обувь", "Центр", "Одежда", "Плавание", "Вело", "Касса"];
-const daysOfWeek = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
-
-// Короткие коды дней для callback_data (избегаем длинной кириллицы в кнопках)
-const dayCodes = { 'Понедельник': 'mon', 'Вторник': 'tue', 'Среда': 'wed', 'Четверг': 'thu', 'Пятница': 'fri', 'Суббота': 'sat', 'Воскресенье': 'sun' };
-const dayCodesReverse = Object.fromEntries(Object.entries(dayCodes).map(([k, v]) => [v, k]));
 
 // Короткие коды отделов для callback_data
 const depCodes = { "Аутлет": "d1", "Альпинизм": "d2", "Обувь": "d3", "Центр": "d4", "Одежда": "d5", "Плавание": "d6", "Вело": "d7", "Касса": "d8" };
@@ -62,9 +57,68 @@ const isStaff = (role) => {
   return role === 'admin' || role === 'manager';
 };
 
-const getAlmatyDayName = () => {
-  const days = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
-  return days[new Date(Date.now() + 5 * 60 * 60 * 1000).getDay()];
+// ==========================================
+// РАБОТА С ДАТАМИ (Алматы, UTC+5)
+// ==========================================
+
+const dayNamesShort = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+const dayNamesFull = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
+
+// Текущая дата/время в Алматы (UTC+5), как объект Date в "псевдо-локальном" сдвиге
+const getAlmatyNow = () => new Date(Date.now() + 5 * 60 * 60 * 1000);
+
+// Форматирует Date в строку YYYY-MM-DD (используем только UTC-методы, т.к. getAlmatyNow уже сдвинут на +5)
+const formatDateISO = (d) => {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
+// Форматирует дату в читаемый вид "29.06"
+const formatDateShort = (isoDate) => {
+  const [y, m, d] = isoDate.split('-');
+  return `${d}.${m}`;
+};
+
+// Возвращает день недели (короткий, "Пн") по ISO-дате
+const getDayShortByDate = (isoDate) => {
+  const d = new Date(isoDate + 'T00:00:00Z');
+  return dayNamesShort[d.getUTCDay()];
+};
+
+const getDayFullByDate = (isoDate) => {
+  const d = new Date(isoDate + 'T00:00:00Z');
+  return dayNamesFull[d.getUTCDay()];
+};
+
+// Сегодняшняя дата в Алматы, формат YYYY-MM-DD
+const getTodayISO = () => formatDateISO(getAlmatyNow());
+
+// Возвращает массив 7 дат текущей недели (Пн -> Нд) в формате YYYY-MM-DD
+const getCurrentWeekDates = () => {
+  const now = getAlmatyNow();
+  const jsDay = now.getUTCDay(); // 0 = Вс, 1 = Пн, ...
+  // Смещение до понедельника этой недели
+  const diffToMonday = (jsDay === 0) ? -6 : (1 - jsDay);
+  const monday = new Date(now);
+  monday.setUTCDate(now.getUTCDate() + diffToMonday);
+
+  const dates = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(monday);
+    d.setUTCDate(monday.getUTCDate() + i);
+    dates.push(formatDateISO(d));
+  }
+  return dates;
+};
+
+// Код даты для callback_data: MMDD (компактно, без неоднозначностей в пределах года)
+const dateToCode = (isoDate) => isoDate.slice(5).replace('-', ''); // "2026-06-29" -> "0629"
+const codeToDate = (code, isoDate) => {
+  // Восстанавливаем год из любой даты текущей недели (все даты недели — в одном году, кроме редкого перехода Дек/Янв)
+  const year = isoDate.slice(0, 4);
+  return `${year}-${code.slice(0, 2)}-${code.slice(2, 4)}`;
 };
 
 // Команда /start
@@ -108,7 +162,7 @@ bot.action('auto_register', async (ctx) => {
   ctx.reply('Используйте меню ниже:', getMainMenu());
 });
 
-// 1. ОЧЕРЕДЬ ОБЕДОВ
+// 1. ОЧЕРЕДЬ ОБЕДОВ (бронирования не зависят от даты — это очередь на сегодняшний день по смыслу использования)
 bot.hears('📊 Завтрак и Обед по отделам', async (ctx) => {
   const { data: dbBookings, error } = await supabase.from('bookings').select('*');
 
@@ -141,33 +195,35 @@ bot.hears('📊 Завтрак и Обед по отделам', async (ctx) => 
 const buildDutiesText = (duties) => {
   let text = '';
   allDepartments.forEach(dep => {
-    const dutyForDep = duties?.find(d => d.department === dep);
-    const name = dutyForDep ? dutyForDep.duty_name : 'Не назначен 🤷‍♂️';
-    text += `  └ *${dep}*: ${name}\n`;
+    const dutiesForDep = duties?.filter(d => d.department === dep) || [];
+    const names = dutiesForDep.length > 0 ? dutiesForDep.map(d => d.duty_name).join(', ') : 'Не назначен 🤷‍♂️';
+    text += `  └ *${dep}*: ${names}\n`;
   });
   return text;
 };
 
-// 2. ДЕЖУРНЫЕ НА НЕДЕЛЮ
+// 2. ДЕЖУРНЫЕ НА НЕДЕЛЮ (по датам текущей недели)
 bot.hears('📅 Дежурные на неделю', async (ctx) => {
   const userId = ctx.from.id.toString();
   const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
-  const { data: duties, error } = await supabase.from('duty').select('*');
+
+  const weekDates = getCurrentWeekDates();
+  const { data: duties, error } = await supabase.from('duty').select('*').in('work_date', weekDates);
 
   if (error) {
     console.error('Ошибка получения дежурных:', error);
     return ctx.reply('⚠️ Не удалось загрузить данные. Попробуйте позже.');
   }
 
-  let text = '📋 *График дежурных на неделю (по отделам):*\n\n';
-  daysOfWeek.forEach(day => {
-    text += `📅 *${day}:*\n`;
-    text += buildDutiesText(duties?.filter(d => d.day_of_week === day));
+  let text = '📋 *График дежурных на текущую неделю (по отделам):*\n\n';
+  weekDates.forEach(date => {
+    text += `📅 *${getDayFullByDate(date)}, ${formatDateShort(date)}:*\n`;
+    text += buildDutiesText(duties?.filter(d => d.work_date === date));
     text += '\n';
   });
 
   if (me && isStaff(me.role)) {
-    const buttons = daysOfWeek.map(day => [Markup.button.callback(`⚙️ Назначить дежурных: ${day}`, `staff_day_${dayCodes[day]}`)]);
+    const buttons = weekDates.map(date => [Markup.button.callback(`⚙️ Назначить дежурных: ${getDayShortByDate(date)} ${formatDateShort(date)}`, `staff_day_${dateToCode(date)}`)]);
     ctx.replyWithMarkdown(text, Markup.inlineKeyboard(buttons));
   } else {
     ctx.replyWithMarkdown(text);
@@ -176,23 +232,23 @@ bot.hears('📅 Дежурные на неделю', async (ctx) => {
 
 // 3. ДЕЖУРНЫЕ НА СЕГОДНЯ
 bot.hears('🔥 Дежурные на сегодня', async (ctx) => {
-  const today = getAlmatyDayName();
-  const { data: todayDuties, error } = await supabase.from('duty').select('*').eq('day_of_week', today);
+  const today = getTodayISO();
+  const { data: todayDuties, error } = await supabase.from('duty').select('*').eq('work_date', today);
 
   if (error) {
     console.error('Ошибка получения дежурных на сегодня:', error);
     return ctx.reply('⚠️ Не удалось загрузить данные. Попробуйте позже.');
   }
 
-  let text = `🔥 *Дежурные сотрудники на СЕГОДНЯ (${today}):*\n\n`;
+  let text = `🔥 *Дежурные сотрудники на СЕГОДНЯ (${getDayFullByDate(today)}, ${formatDateShort(today)}):*\n\n`;
   text += buildDutiesText(todayDuties);
   ctx.replyWithMarkdown(text);
 });
 
 // Вспомогательная функция для сборки текста графика работы
-const buildScheduleText = (day, scheduleData) => {
-  let text = `📅 *${day}:*\n`;
-  const daySchedule = scheduleData?.filter(s => s.day_of_week === day) || [];
+const buildScheduleText = (date, scheduleData) => {
+  let text = `📅 *${getDayFullByDate(date)}, ${formatDateShort(date)}:*\n`;
+  const daySchedule = scheduleData?.filter(s => s.work_date === date) || [];
   allDepartments.forEach(dep => {
     const workers = daySchedule.filter(s => s.department === dep).map(s => s.user_name).join(', ');
     text += `  └ *${dep}*: ${workers || 'Никто не работает ❌'}\n`;
@@ -202,24 +258,26 @@ const buildScheduleText = (day, scheduleData) => {
 
 // 4. ГРАФИК НА СЕГОДНЯ
 bot.hears('📆 График на сегодня', async (ctx) => {
-  const today = getAlmatyDayName();
-  const { data: scheduleData, error } = await supabase.from('schedule').select('*').eq('day_of_week', today);
+  const today = getTodayISO();
+  const { data: scheduleData, error } = await supabase.from('schedule').select('*').eq('work_date', today);
 
   if (error) {
     console.error('Ошибка получения графика на сегодня:', error);
     return ctx.reply('⚠️ Не удалось загрузить данные. Попробуйте позже.');
   }
 
-  let text = `📆 *График работы сотрудников на СЕГОДНЯ (${today}):*\n\n`;
+  let text = `📆 *График работы сотрудников на СЕГОДНЯ:*\n\n`;
   text += buildScheduleText(today, scheduleData);
   ctx.replyWithMarkdown(text);
 });
 
-// 5. ПРОСМОТР И УПРАВЛЕНИЕ ГРАФИКОМ НА НЕДЕЛЮ
+// 5. ПРОСМОТР И УПРАВЛЕНИЕ ГРАФИКОМ НА НЕДЕЛЮ (по датам текущей недели)
 bot.hears('📝 График работы на неделю', async (ctx) => {
   const userId = ctx.from.id.toString();
   const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
-  const { data: scheduleData, error } = await supabase.from('schedule').select('*');
+
+  const weekDates = getCurrentWeekDates();
+  const { data: scheduleData, error } = await supabase.from('schedule').select('*').in('work_date', weekDates);
 
   if (error) {
     console.error('Ошибка получения графика на неделю:', error);
@@ -227,13 +285,13 @@ bot.hears('📝 График работы на неделю', async (ctx) => {
   }
 
   let text = '📝 *Текущий график работы сотрудников на неделю:*\n\n';
-  daysOfWeek.forEach(day => {
-    text += buildScheduleText(day, scheduleData);
+  weekDates.forEach(date => {
+    text += buildScheduleText(date, scheduleData);
     text += '\n';
   });
 
   if (me && isStaff(me.role)) {
-    const buttons = daysOfWeek.map(day => [Markup.button.callback(`⚙️ Редактировать график: ${day}`, `sched_day_${dayCodes[day]}`)]);
+    const buttons = weekDates.map(date => [Markup.button.callback(`⚙️ Редактировать график: ${getDayShortByDate(date)} ${formatDateShort(date)}`, `sched_day_${dateToCode(date)}`)]);
     ctx.replyWithMarkdown(text, Markup.inlineKeyboard(buttons));
   } else {
     ctx.replyWithMarkdown(text);
@@ -245,19 +303,22 @@ bot.hears('📝 График работы на неделю', async (ctx) => {
 // АДМИНКА ГРАФИКА РАБОТЫ
 // ==========================================
 
-bot.action(/^sched_day_(.+)$/, async (ctx) => {
-  const day = dayCodesReverse[ctx.match[1]];
-  const buttons = allDepartments.map(dep => [Markup.button.callback(`Отдел: ${dep}`, `sched_dep_${ctx.match[1]}_${depCodes[dep]}`)]);
-  ctx.editMessageText(`Редактирование графика на *${day}*.\nВыберите отдел:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+bot.action(/^sched_day_(\d{4})$/, async (ctx) => {
+  const weekDates = getCurrentWeekDates();
+  const dateCode = ctx.match[1];
+  const date = codeToDate(dateCode, weekDates[0]);
+  const buttons = allDepartments.map(dep => [Markup.button.callback(`Отдел: ${dep}`, `sched_dep_${dateCode}_${depCodes[dep]}`)]);
+  ctx.editMessageText(`Редактирование графика на *${getDayFullByDate(date)}, ${formatDateShort(date)}*.\nВыберите отдел:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
 // Отрендерить меню выбора сотрудников со статусами (кто уже добавлен, а кто нет)
-const renderWorkersMenu = async (ctx, dayCode, depCode) => {
-  const day = dayCodesReverse[dayCode];
+const renderWorkersMenu = async (ctx, dateCode, depCode) => {
+  const weekDates = getCurrentWeekDates();
+  const date = codeToDate(dateCode, weekDates[0]);
   const dep = depCodesReverse[depCode];
 
   const { data: allUsers, error: usersError } = await supabase.from('users').select('id, name');
-  const { data: currentWorkers, error: workersError } = await supabase.from('schedule').select('user_id').eq('day_of_week', day).eq('department', dep);
+  const { data: currentWorkers, error: workersError } = await supabase.from('schedule').select('user_id').eq('work_date', date).eq('department', dep);
 
   if (usersError || workersError) {
     console.error('Ошибка загрузки меню сотрудников:', usersError || workersError);
@@ -271,29 +332,30 @@ const renderWorkersMenu = async (ctx, dayCode, depCode) => {
   const buttons = allUsers.map(u => {
     const isAdded = workerIds.includes(u.id.toString());
     const label = isAdded ? `✅ ${u.name} (В смене)` : `➕ ${u.name}`;
-    return [Markup.button.callback(label, `sched_toggle_${dayCode}_${depCode}_${u.id}`)];
+    return [Markup.button.callback(label, `sched_toggle_${dateCode}_${depCode}_${u.id}`)];
   });
 
-  buttons.push([Markup.button.callback('⬅️ Назад к отделам', `sched_day_${dayCode}`)]);
+  buttons.push([Markup.button.callback('⬅️ Назад к отделам', `sched_day_${dateCode}`)]);
 
   await ctx.editMessageText(
-    `Управление сменами: отдел *${dep}*, день *${day}*.\nНажмите на имя сотрудника, чтобы добавить или удалить его из графика:`,
+    `Управление сменами: отдел *${dep}*, день *${getDayFullByDate(date)}, ${formatDateShort(date)}*.\nНажмите на имя сотрудника, чтобы добавить или удалить его из графика:`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
 };
 
-bot.action(/^sched_dep_(.+)_(.+)$/, async (ctx) => {
+bot.action(/^sched_dep_(\d{4})_(.+)$/, async (ctx) => {
   await renderWorkersMenu(ctx, ctx.match[1], ctx.match[2]);
 });
 
-bot.action(/^sched_toggle_(.+)_(.+)_(.+)$/, async (ctx) => {
-  const dayCode = ctx.match[1];
+bot.action(/^sched_toggle_(\d{4})_(.+)_(.+)$/, async (ctx) => {
+  const dateCode = ctx.match[1];
   const depCode = ctx.match[2];
   const targetUserId = ctx.match[3].toString();
-  const day = dayCodesReverse[dayCode];
+  const weekDates = getCurrentWeekDates();
+  const date = codeToDate(dateCode, weekDates[0]);
   const dep = depCodesReverse[depCode];
 
-  const { data: exist } = await supabase.from('schedule').select('id').eq('day_of_week', day).eq('department', dep).eq('user_id', targetUserId).maybeSingle();
+  const { data: exist } = await supabase.from('schedule').select('id').eq('work_date', date).eq('department', dep).eq('user_id', targetUserId).maybeSingle();
 
   if (exist) {
     const { error } = await supabase.from('schedule').delete().eq('id', exist.id);
@@ -305,7 +367,7 @@ bot.action(/^sched_toggle_(.+)_(.+)_(.+)$/, async (ctx) => {
   } else {
     const { data: user } = await supabase.from('users').select('name').eq('id', targetUserId).maybeSingle();
     if (user) {
-      const { error } = await supabase.from('schedule').insert({ user_id: targetUserId, user_name: user.name, day_of_week: day, department: dep });
+      const { error } = await supabase.from('schedule').insert({ user_id: targetUserId, user_name: user.name, work_date: date, day_of_week: getDayFullByDate(date), department: dep });
       if (error) {
         console.error('Ошибка добавления в график:', error);
         return ctx.answerCbQuery('⚠️ Не удалось добавить в график. Проверьте настройки доступа к базе.', { show_alert: true });
@@ -317,81 +379,94 @@ bot.action(/^sched_toggle_(.+)_(.+)_(.+)$/, async (ctx) => {
   }
 
   // Перерисовываем меню со свежими статусами только после подтверждённой записи
-  await renderWorkersMenu(ctx, dayCode, depCode);
+  await renderWorkersMenu(ctx, dateCode, depCode);
 });
 
 
 // ==========================================
-// НАЗНАЧЕНИЕ ДЕЖУРНЫХ (СВЯЗАННОЕ С ГРАФИКОМ)
+// НАЗНАЧЕНИЕ ДЕЖУРНЫХ (СВЯЗАННОЕ С ГРАФИКОМ, поддержка НЕСКОЛЬКИХ дежурных на отдел)
 // ==========================================
 
-bot.action(/^staff_day_(.+)$/, async (ctx) => {
-  const dayCode = ctx.match[1];
-  const day = dayCodesReverse[dayCode];
-  const buttons = allDepartments.map(dep => [Markup.button.callback(`Отдел: ${dep}`, `staff_dep_${dayCode}_${depCodes[dep]}`)]);
-  ctx.editMessageText(`Управление дежурными на *${day}*.\nВыберите отдел:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+bot.action(/^staff_day_(\d{4})$/, async (ctx) => {
+  const weekDates = getCurrentWeekDates();
+  const dateCode = ctx.match[1];
+  const date = codeToDate(dateCode, weekDates[0]);
+  const buttons = allDepartments.map(dep => [Markup.button.callback(`Отдел: ${dep}`, `staff_dep_${dateCode}_${depCodes[dep]}`)]);
+  ctx.editMessageText(`Управление дежурными на *${getDayFullByDate(date)}, ${formatDateShort(date)}*.\nВыберите отдел:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
-bot.action(/^staff_dep_(.+)_(.+)$/, async (ctx) => {
-  const dayCode = ctx.match[1];
-  const depCode = ctx.match[2];
-  const day = dayCodesReverse[dayCode];
+// Меню назначения дежурных: показывает сотрудников из графика на этот день/отдел с галочками (дежурный/не дежурный)
+const renderDutyMenu = async (ctx, dateCode, depCode) => {
+  const weekDates = getCurrentWeekDates();
+  const date = codeToDate(dateCode, weekDates[0]);
   const dep = depCodesReverse[depCode];
 
-  const { data: workersToday, error } = await supabase.from('schedule').select('user_id, user_name').eq('day_of_week', day).eq('department', dep);
+  const { data: workersToday, error: workersError } = await supabase.from('schedule').select('user_id, user_name').eq('work_date', date).eq('department', dep);
+  const { data: currentDuties, error: dutiesError } = await supabase.from('duty').select('user_id').eq('work_date', date).eq('department', dep);
 
-  if (error) {
-    console.error('Ошибка получения смены:', error);
+  if (workersError || dutiesError) {
+    console.error('Ошибка загрузки меню дежурных:', workersError || dutiesError);
     return ctx.answerCbQuery('⚠️ Ошибка загрузки данных', { show_alert: true });
   }
 
   if (!workersToday || workersToday.length === 0) {
-    const buttons = [[Markup.button.callback('⬅️ Назад к отделам', `staff_day_${dayCode}`)]];
-    return ctx.editMessageText(`❌ Нельзя назначить дежурного на *${day}* в отдел *${dep}*.\n\nПо графику работы в этот день в данном отделе *никто не числится*. Сначала заполните график!`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    const buttons = [[Markup.button.callback('⬅️ Назад к отделам', `staff_day_${dateCode}`)]];
+    return ctx.editMessageText(`❌ Нельзя назначить дежурного на *${getDayFullByDate(date)}, ${formatDateShort(date)}* в отдел *${dep}*.\n\nПо графику работы в этот день в данном отделе *никто не числится*. Сначала заполните график!`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
   }
 
-  const buttons = workersToday.map(w => [Markup.button.callback(w.user_name, `assign_duty_${dayCode}_${depCode}_${w.user_id}`)]);
-  buttons.push([Markup.button.callback('❌ Сбросить дежурного', `assign_duty_${dayCode}_${depCode}_clear`)]);
-  buttons.push([Markup.button.callback('⬅️ Назад', `staff_day_${dayCode}`)]);
+  const dutyUserIds = currentDuties?.map(d => d.user_id.toString()) || [];
 
-  ctx.editMessageText(`Назначаем дежурного в отдел *${dep}* на *${day}*.\nДоступны только сотрудники, стоящие в смене по графику:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  const buttons = workersToday.map(w => {
+    const isDuty = dutyUserIds.includes(w.user_id.toString());
+    const label = isDuty ? `✅ ${w.user_name} (Дежурный)` : `➕ ${w.user_name}`;
+    return [Markup.button.callback(label, `duty_toggle_${dateCode}_${depCode}_${w.user_id}`)];
+  });
+  buttons.push([Markup.button.callback('⬅️ Назад', `staff_day_${dateCode}`)]);
+
+  ctx.editMessageText(
+    `Назначаем дежурных в отдел *${dep}* на *${getDayFullByDate(date)}, ${formatDateShort(date)}*.\nМожно выбрать несколько человек. Нажмите на имя, чтобы назначить/снять дежурство:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+  );
+};
+
+bot.action(/^staff_dep_(\d{4})_(.+)$/, async (ctx) => {
+  await renderDutyMenu(ctx, ctx.match[1], ctx.match[2]);
 });
 
-bot.action(/^assign_duty_(.+)_(.+)_(.+)$/, async (ctx) => {
-  const dayCode = ctx.match[1];
+bot.action(/^duty_toggle_(\d{4})_(.+)_(.+)$/, async (ctx) => {
+  const dateCode = ctx.match[1];
   const depCode = ctx.match[2];
-  const targetUserId = ctx.match[3];
-  const day = dayCodesReverse[dayCode];
+  const targetUserId = ctx.match[3].toString();
+  const weekDates = getCurrentWeekDates();
+  const date = codeToDate(dateCode, weekDates[0]);
   const dep = depCodesReverse[depCode];
 
-  const { error: deleteError } = await supabase.from('duty').delete().eq('day_of_week', day).eq('department', dep);
+  const { data: exist } = await supabase.from('duty').select('id').eq('work_date', date).eq('department', dep).eq('user_id', targetUserId).maybeSingle();
 
-  if (deleteError) {
-    console.error('Ошибка очистки дежурного:', deleteError);
-    return ctx.answerCbQuery('⚠️ Ошибка обновления данных', { show_alert: true });
+  if (exist) {
+    const { error } = await supabase.from('duty').delete().eq('id', exist.id);
+    if (error) {
+      console.error('Ошибка снятия дежурства:', error);
+      return ctx.answerCbQuery('⚠️ Не удалось снять дежурство.', { show_alert: true });
+    }
+    ctx.answerCbQuery('Дежурство снято');
+  } else {
+    const { data: targetUser } = await supabase.from('users').select('name').eq('id', targetUserId).maybeSingle();
+    if (!targetUser) return ctx.answerCbQuery('⚠️ Пользователь не найден', { show_alert: true });
+
+    const { error } = await supabase.from('duty').insert({ work_date: date, day_of_week: getDayFullByDate(date), department: dep, duty_name: targetUser.name, user_id: targetUserId });
+    if (error) {
+      console.error('Ошибка назначения дежурного:', error);
+      return ctx.answerCbQuery('⚠️ Не удалось назначить дежурного.', { show_alert: true });
+    }
+    ctx.answerCbQuery(`Назначен: ${targetUser.name}`);
+
+    try {
+      await bot.telegram.sendMessage(targetUserId, `🔔 Вас назначили дежурным на *${getDayFullByDate(date)}, ${formatDateShort(date)}* в отдел *${dep}*!`, { parse_mode: 'Markdown' });
+    } catch (e) {}
   }
 
-  if (targetUserId === 'clear') {
-    ctx.answerCbQuery('Дежурный сброшен');
-    return ctx.editMessageText(`Дежурный на *${day}* в отделе *${dep}* успешно сброшен.`, { parse_mode: 'Markdown' });
-  }
-
-  const { data: targetUser } = await supabase.from('users').select('name').eq('id', targetUserId).maybeSingle();
-  if (!targetUser) return ctx.answerCbQuery('Пользователь не найден');
-
-  const { error: insertError } = await supabase.from('duty').insert({ day_of_week: day, department: dep, duty_name: targetUser.name, user_id: targetUserId });
-
-  if (insertError) {
-    console.error('Ошибка назначения дежурного:', insertError);
-    return ctx.answerCbQuery('⚠️ Не удалось назначить дежурного. Проверьте настройки доступа к базе.', { show_alert: true });
-  }
-
-  ctx.answerCbQuery(`Назначен: ${targetUser.name}`);
-  ctx.editMessageText(`На *${day}* в отдел *${dep}* дежурным назначен *${targetUser.name}*!`, { parse_mode: 'Markdown' });
-
-  try {
-    await bot.telegram.sendMessage(targetUserId, `🔔 Вас назначили дежурным на *${day}* в отдел *${dep}*!`, { parse_mode: 'Markdown' });
-  } catch (e) {}
+  await renderDutyMenu(ctx, dateCode, depCode);
 });
 
 
