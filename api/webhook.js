@@ -3,6 +3,8 @@ const { createClient } = require('@supabase/supabase-js');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 // Группы отделов для очереди обедов
 const departmentGroups = {
@@ -46,6 +48,7 @@ const getMainMenu = (staff = false) => {
     ['❌ Отменить мою бронь']
   ];
   if (staff) rows.push(['📌 Поставить задачу', '📋 Задачи команды']);
+  if (staff) rows.push(['🤖 Написать график текстом']);
   return Markup.keyboard(rows).resize();
 };
 
@@ -549,6 +552,110 @@ bot.action(/^task_done_(.+)$/, async (ctx) => {
 
 
 // ==========================================
+// ГРАФИК ЧЕРЕЗ СВОБОДНЫЙ ТЕКСТ (Gemini)
+// ==========================================
+
+// Сопоставление написанного имени с реальным пользователем из базы (без учёта регистра, по подстроке)
+const matchUserByName = (writtenName, allUsers) => {
+  const normalized = writtenName.trim().toLowerCase();
+  let best = allUsers.find(u => u.name.toLowerCase() === normalized);
+  if (best) return best;
+  best = allUsers.find(u => u.name.toLowerCase().includes(normalized) || normalized.includes(u.name.toLowerCase()));
+  return best || null;
+};
+
+const callGemini = async (userText, weekDates) => {
+  const weekInfo = weekDates.map(d => `${d} (${getDayFullByDate(d)})`).join(', ');
+  const prompt = `Ты помощник, который превращает свободный текст о графике работы или дежурствах в JSON.
+Доступные отделы: ${allDepartments.join(', ')}.
+Даты текущей недели: ${weekInfo}.
+Если в тексте упомянут день недели без даты — определи дату из списка выше.
+Если дата/день не указаны явно — считай, что речь про сегодня: ${getTodayISO()}.
+
+Верни СТРОГО JSON без markdown и пояснений, формат:
+{"entries": [{"date": "YYYY-MM-DD", "department": "название отдела", "worker": "имя сотрудника", "is_duty": true|false}]}
+
+is_duty = true если человек назначается ДЕЖУРНЫМ (слова "дежурный", "дежурит"), иначе false (обычный график работы).
+Если в тексте несколько человек на один отдел/дату — верни несколько записей entries.
+Если не можешь понять текст — верни {"entries": []}.
+
+Текст пользователя: "${userText}"`;
+
+  const response = await fetch(GEMINI_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error('Ошибка Gemini API:', errText);
+    return null;
+  }
+
+  const data = await response.json();
+  let raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  raw = raw.replace(/```json|```/g, '').trim();
+
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error('Не удалось распарсить ответ Gemini:', raw);
+    return null;
+  }
+};
+
+bot.hears('🤖 Написать график текстом', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  if (!me || !isStaff(me.role)) return;
+
+  await setPendingAction(userId, JSON.stringify({ type: 'awaiting_ai_schedule_text' }));
+  ctx.reply('✏️ Напишите свободным текстом, кто и где работает или дежурит.\nНапример: "завтра Вася Ж на обуви, а Кристина дежурная на кассе"');
+});
+
+// Применяем подтверждённые записи к базе (schedule или duty в зависимости от is_duty)
+const applyScheduleEntries = async (entries) => {
+  let okCount = 0, failCount = 0;
+  for (const e of entries) {
+    const table = e.is_duty ? 'duty' : 'schedule';
+    const payload = e.is_duty
+      ? { work_date: e.date, day_of_week: getDayFullByDate(e.date), department: e.department, duty_name: e.userName, user_id: e.userId }
+      : { user_id: e.userId, user_name: e.userName, work_date: e.date, day_of_week: getDayFullByDate(e.date), department: e.department };
+
+    // Не дублируем запись, если уже есть точно такая же
+    const { data: exist } = await supabase.from(table).select('id').eq('work_date', e.date).eq('department', e.department).eq('user_id', e.userId).maybeSingle();
+    if (exist) { okCount++; continue; }
+
+    const { error } = await supabase.from(table).insert(payload);
+    if (error) { console.error(`Ошибка записи (${table}):`, error); failCount++; } else { okCount++; }
+  }
+  return { okCount, failCount };
+};
+
+bot.action(/^ai_confirm_(.+)$/, async (ctx) => {
+  const requestId = ctx.match[1];
+  const { data: req, error } = await supabase.from('ai_requests').select('*').eq('id', requestId).maybeSingle();
+  if (error || !req) return ctx.answerCbQuery('⚠️ Запрос не найден или устарел', { show_alert: true });
+
+  const entries = JSON.parse(req.entries_json);
+  const { okCount, failCount } = await applyScheduleEntries(entries);
+
+  await supabase.from('ai_requests').delete().eq('id', requestId);
+
+  ctx.answerCbQuery('Записано ✅');
+  ctx.editMessageText(`✅ Записано в график: ${okCount} запис(ей).${failCount > 0 ? `\n⚠️ Ошибок: ${failCount}` : ''}`);
+});
+
+bot.action(/^ai_cancel_(.+)$/, async (ctx) => {
+  const requestId = ctx.match[1];
+  await supabase.from('ai_requests').delete().eq('id', requestId);
+  ctx.answerCbQuery('Отменено');
+  ctx.editMessageText('❌ Отменено, изменения не внесены.');
+});
+
+
+// ==========================================
 // БРОНИРОВАНИЯ (ОБЕДЫ)
 // ==========================================
 
@@ -628,6 +735,54 @@ bot.on('text', async (ctx) => {
 
   let pending;
   try { pending = JSON.parse(me.pending_action); } catch (e) { return clearPendingAction(userId); }
+
+  if (pending.type === 'awaiting_ai_schedule_text') {
+    await clearPendingAction(userId);
+    const weekDates = getCurrentWeekDates();
+
+    const waitMsg = await ctx.reply('🤖 Думаю...');
+    const result = await callGemini(ctx.message.text, weekDates);
+
+    if (!result || !result.entries || result.entries.length === 0) {
+      return ctx.reply('⚠️ Не удалось понять текст. Попробуйте переформулировать, например: "завтра Вася Ж на обуви".');
+    }
+
+    const { data: allUsers } = await supabase.from('users').select('id, name');
+    const resolvedEntries = [];
+    const problems = [];
+
+    for (const e of result.entries) {
+      const dep = allDepartments.find(d => d.toLowerCase() === (e.department || '').toLowerCase());
+      const matchedUser = matchUserByName(e.worker || '', allUsers || []);
+
+      if (!dep) { problems.push(`Не нашёл отдел "${e.department}"`); continue; }
+      if (!matchedUser) { problems.push(`Не нашёл сотрудника "${e.worker}"`); continue; }
+      if (!e.date) { problems.push(`Не указана дата для "${e.worker}"`); continue; }
+
+      resolvedEntries.push({ date: e.date, department: dep, userId: matchedUser.id, userName: matchedUser.name, is_duty: !!e.is_duty });
+    }
+
+    if (resolvedEntries.length === 0) {
+      return ctx.reply(`⚠️ Не удалось сопоставить данные:\n${problems.join('\n')}`);
+    }
+
+    let preview = '🤖 *Я понял так:*\n\n';
+    resolvedEntries.forEach(e => {
+      preview += `${e.is_duty ? '🔔 Дежурный' : '👷 Работает'}: *${e.userName}* — *${e.department}*, ${getDayFullByDate(e.date)} ${formatDateShort(e.date)}\n`;
+    });
+    if (problems.length > 0) preview += `\n⚠️ Не учтено: ${problems.join('; ')}\n`;
+    preview += '\nЗаписать в график?';
+
+    const { data: savedReq, error: saveError } = await supabase.from('ai_requests').insert({ entries_json: JSON.stringify(resolvedEntries) }).select().single();
+    if (saveError) {
+      console.error('Ошибка сохранения ai_request:', saveError);
+      return ctx.reply('⚠️ Ошибка обработки. Попробуйте снова.');
+    }
+
+    return ctx.replyWithMarkdown(preview, Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Записать', `ai_confirm_${savedReq.id}`), Markup.button.callback('❌ Отмена', `ai_cancel_${savedReq.id}`)]
+    ]));
+  }
 
   if (pending.type === 'awaiting_task_text') {
     const taskText = ctx.message.text.trim();
