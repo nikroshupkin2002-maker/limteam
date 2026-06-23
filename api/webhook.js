@@ -4,7 +4,9 @@ const { createClient } = require('@supabase/supabase-js');
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+// Пробуем модели по очереди: если одна перегружена (503), пытаемся со следующей
+const GEMINI_MODELS = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+const geminiUrl = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
 
 // Группы отделов для очереди обедов
 const departmentGroups = {
@@ -603,27 +605,49 @@ const callGemini = async (userText, weekDates, allUsers) => {
 
 Фраза пользователя: "${userText}"`;
 
-  let response;
-  try {
-    response = await fetch(GEMINI_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-    });
-  } catch (e) {
-    console.error('Сетевая ошибка запроса к Gemini:', e);
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  let raw = null;
+
+  for (const model of GEMINI_MODELS) {
+    // Для каждой модели — до 2 попыток (на случай временной перегрузки 503)
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      let response;
+      try {
+        response = await fetch(geminiUrl(model), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        });
+      } catch (e) {
+        console.error(`Сетевая ошибка запроса к Gemini (${model}, попытка ${attempt}):`, e);
+        break; // сетевая ошибка — переходим к следующей модели, не к retry
+      }
+
+      if (response.ok) {
+        const data = await response.json();
+        raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        console.log(`Ответ Gemini (${model}):`, raw);
+        break;
+      }
+
+      const errText = await response.text();
+      console.error(`Ошибка Gemini API (${model}, попытка ${attempt}), статус:`, response.status, 'тело:', errText);
+
+      if (response.status === 503 && attempt === 1) {
+        await sleep(1500); // модель перегружена — короткая пауза и повтор той же модели
+        continue;
+      }
+      break; // другая ошибка или вторая попытка не удалась — пробуем следующую модель
+    }
+    if (raw !== null) break; // получили ответ — дальше не перебираем модели
+  }
+
+  if (raw === null) {
+    console.error('Все модели Gemini недоступны.');
     return null;
   }
 
-  if (!response.ok) {
-    const errText = await response.text();
-    console.error('Ошибка Gemini API, статус:', response.status, 'тело:', errText);
-    return null;
-  }
-
-  const data = await response.json();
-  let raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  console.log('Сырой ответ Gemini:', raw);
   raw = raw.replace(/```json|```/g, '').trim();
 
   try {
