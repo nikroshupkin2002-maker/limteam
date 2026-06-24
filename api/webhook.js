@@ -72,6 +72,9 @@ const isStaff = (role) => {
   return role === 'admin' || role === 'manager';
 };
 
+// Редактировать ОБЫЧНЫЙ график работы может только admin (менеджер — нет, только дежурные/задачи своего отдела)
+const isAdminRole = (role) => role === 'admin';
+
 // ==========================================
 // РАБОТА С ДАТАМИ (Алматы, UTC+5)
 // ==========================================
@@ -329,7 +332,8 @@ bot.hears('📝 График работы на неделю', async (ctx) => {
     text += '\n';
   });
 
-  if (me && isStaff(me.role)) {
+  const amISuperAdmin = SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString();
+  if (me && (isAdminRole(me.role) || amISuperAdmin)) {
     const buttons = weekDates.map(date => [Markup.button.callback(`⚙️ Редактировать график: ${getDayShortByDate(date)} ${formatDateShort(date)}`, `sched_day_${dateToCode(date)}`)]);
     ctx.replyWithMarkdown(text, Markup.inlineKeyboard(buttons));
   } else {
@@ -343,6 +347,11 @@ bot.hears('📝 График работы на неделю', async (ctx) => {
 // ==========================================
 
 bot.action(/^sched_day_(\d{4})$/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  const amISuperAdmin = SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString();
+  if (!amISuperAdmin && (!me || !isAdminRole(me.role))) return ctx.answerCbQuery('⛔ Редактировать график может только администратор', { show_alert: true });
+
   const weekDates = getCurrentWeekDates();
   const dateCode = ctx.match[1];
   const date = codeToDate(dateCode, weekDates[0]);
@@ -352,6 +361,11 @@ bot.action(/^sched_day_(\d{4})$/, async (ctx) => {
 
 // Отрендерить меню выбора сотрудников со статусами (кто уже добавлен, а кто нет)
 const renderWorkersMenu = async (ctx, dateCode, depCode) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  const amISuperAdmin = SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString();
+  if (!amISuperAdmin && (!me || !isAdminRole(me.role))) return ctx.answerCbQuery('⛔ Редактировать график может только администратор', { show_alert: true });
+
   const weekDates = getCurrentWeekDates();
   const date = codeToDate(dateCode, weekDates[0]);
   const dep = depCodesReverse[depCode];
@@ -427,10 +441,16 @@ bot.action(/^sched_toggle_(\d{4})_(.+)_(.+)$/, async (ctx) => {
 // ==========================================
 
 bot.action(/^staff_day_(\d{4})$/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role, managed_department').eq('id', userId).maybeSingle();
+  if (!me || !isStaff(me.role)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+
   const weekDates = getCurrentWeekDates();
   const dateCode = ctx.match[1];
   const date = codeToDate(dateCode, weekDates[0]);
-  const buttons = allDepartments.map(dep => [Markup.button.callback(`Отдел: ${dep}`, `staff_dep_${dateCode}_${depCodes[dep]}`)]);
+
+  const visibleDepartments = (me.role === 'manager' && me.managed_department) ? [me.managed_department] : allDepartments;
+  const buttons = visibleDepartments.map(dep => [Markup.button.callback(`Отдел: ${dep}`, `staff_dep_${dateCode}_${depCodes[dep]}`)]);
   ctx.editMessageText(`Управление дежурными на *${getDayFullByDate(date)}, ${formatDateShort(date)}*.\nВыберите отдел:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
@@ -439,6 +459,13 @@ const renderDutyMenu = async (ctx, dateCode, depCode) => {
   const weekDates = getCurrentWeekDates();
   const date = codeToDate(dateCode, weekDates[0]);
   const dep = depCodesReverse[depCode];
+
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role, managed_department').eq('id', userId).maybeSingle();
+  if (!me || !isStaff(me.role)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+  if (me.role === 'manager' && me.managed_department && me.managed_department !== dep) {
+    return ctx.answerCbQuery(`⛔ Вы менеджер только отдела "${me.managed_department}"`, { show_alert: true });
+  }
 
   const { data: workersToday, error: workersError } = await supabase.from('schedule').select('user_id, user_name').eq('work_date', date).eq('department', dep);
   const { data: currentDuties, error: dutiesError } = await supabase.from('duty').select('user_id').eq('work_date', date).eq('department', dep);
@@ -502,7 +529,9 @@ bot.action(/^duty_toggle_(\d{4})_(.+)_(.+)$/, async (ctx) => {
 
     try {
       await bot.telegram.sendMessage(targetUserId, `🔔 Вас назначили дежурным на *${getDayFullByDate(date)}, ${formatDateShort(date)}* в отдел *${dep}*!`, { parse_mode: 'Markdown' });
-    } catch (e) {}
+    } catch (e) {
+      console.error(`Не удалось отправить уведомление о дежурстве пользователю ${targetUserId}:`, e.message);
+    }
   }
 
   await renderDutyMenu(ctx, dateCode, depCode);
@@ -536,17 +565,21 @@ bot.action(/^role_menu_(.+)$/, async (ctx) => {
   if (!isSuperAdmin(ctx)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
 
   const targetId = ctx.match[1];
-  const { data: targetUser } = await supabase.from('users').select('name, role').eq('id', targetId).maybeSingle();
+  const { data: targetUser } = await supabase.from('users').select('name, role, managed_department').eq('id', targetId).maybeSingle();
   if (!targetUser) return ctx.answerCbQuery('Пользователь не найден', { show_alert: true });
 
+  const roleInfo = targetUser.role === 'manager' && targetUser.managed_department
+    ? `${targetUser.role} (отдел: ${targetUser.managed_department})`
+    : targetUser.role;
+
   ctx.editMessageText(
-    `Сотрудник: *${targetUser.name}*\nТекущая роль: *${targetUser.role}*\n\nВыберите новую роль:`,
+    `Сотрудник: *${targetUser.name}*\nТекущая роль: *${roleInfo}*\n\nВыберите новую роль:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [Markup.button.callback('👤 Обычный сотрудник (user)', `role_set_${targetId}_user`)],
         [Markup.button.callback('🛡️ Админ (admin)', `role_set_${targetId}_admin`)],
-        [Markup.button.callback('👑 Менеджер (manager)', `role_set_${targetId}_manager`)],
+        [Markup.button.callback('👑 Менеджер (manager)', `role_pick_dep_${targetId}`)],
         [Markup.button.callback('⬅️ Назад', 'role_back')]
       ])
     }
@@ -564,13 +597,47 @@ bot.action('role_back', async (ctx) => {
   ctx.editMessageText('Выберите сотрудника для изменения прав доступа:', Markup.inlineKeyboard(buttons));
 });
 
-bot.action(/^role_set_(.+)_(user|admin|manager)$/, async (ctx) => {
+// Менеджеру обязательно нужно указать отдел — отдельный шаг выбора
+bot.action(/^role_pick_dep_(.+)$/, async (ctx) => {
+  if (!isSuperAdmin(ctx)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+
+  const targetId = ctx.match[1];
+  const buttons = allDepartments.map(dep => [Markup.button.callback(dep, `role_set_manager_${targetId}_${depCodes[dep]}`)]);
+  buttons.push([Markup.button.callback('⬅️ Назад', `role_menu_${targetId}`)]);
+
+  ctx.editMessageText('В каком отделе этот сотрудник будет менеджером?', Markup.inlineKeyboard(buttons));
+});
+
+bot.action(/^role_set_manager_(.+)_(.+)$/, async (ctx) => {
+  if (!isSuperAdmin(ctx)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+
+  const targetId = ctx.match[1];
+  const dep = depCodesReverse[ctx.match[2]];
+
+  const { data: targetUser, error } = await supabase.from('users').update({ role: 'manager', managed_department: dep }).eq('id', targetId).select('name').maybeSingle();
+  if (error || !targetUser) {
+    console.error('Ошибка назначения менеджера:', error);
+    return ctx.answerCbQuery('⚠️ Не удалось назначить менеджера', { show_alert: true });
+  }
+
+  ctx.answerCbQuery(`Менеджер отдела: ${dep}`);
+  ctx.editMessageText(`✅ ${targetUser.name} теперь менеджер отдела *${dep}*.`, { parse_mode: 'Markdown' });
+
+  try {
+    await bot.telegram.sendMessage(targetId, `🔔 Вы назначены менеджером отдела *${dep}*. Нажмите /start, чтобы обновить меню.`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error(`Не удалось отправить уведомление о назначении менеджером ${targetId}:`, e.message);
+  }
+});
+
+bot.action(/^role_set_(.+)_(user|admin)$/, async (ctx) => {
   if (!isSuperAdmin(ctx)) return ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
 
   const targetId = ctx.match[1];
   const newRole = ctx.match[2];
 
-  const { data: targetUser, error } = await supabase.from('users').update({ role: newRole }).eq('id', targetId).select('name').maybeSingle();
+  // Снимаем managed_department, если человека переводят из менеджера в другую роль
+  const { data: targetUser, error } = await supabase.from('users').update({ role: newRole, managed_department: null }).eq('id', targetId).select('name').maybeSingle();
   if (error || !targetUser) {
     console.error('Ошибка изменения роли:', error);
     return ctx.answerCbQuery('⚠️ Не удалось изменить роль', { show_alert: true });
@@ -581,7 +648,9 @@ bot.action(/^role_set_(.+)_(user|admin|manager)$/, async (ctx) => {
 
   try {
     await bot.telegram.sendMessage(targetId, `🔔 Ваши права доступа были изменены. Нажмите /start, чтобы обновить меню.`);
-  } catch (e) {}
+  } catch (e) {
+    console.error(`Не удалось отправить уведомление о смене роли пользователю ${targetId}:`, e.message);
+  }
 });
 
 
@@ -599,11 +668,23 @@ const clearPendingAction = async (userId) => {
 
 bot.hears('📌 Поставить задачу', async (ctx) => {
   const userId = ctx.from.id.toString();
-  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  const { data: me } = await supabase.from('users').select('role, managed_department').eq('id', userId).maybeSingle();
   if (!me || !isStaff(me.role)) return;
 
-  const { data: allUsers } = await supabase.from('users').select('id, name').neq('id', userId);
-  if (!allUsers || allUsers.length === 0) return ctx.reply('Нет сотрудников в базе.');
+  let allUsers;
+
+  if (me.role === 'manager' && me.managed_department) {
+    // Менеджер видит только тех, кто СЕГОДНЯ по графику стоит в его отделе
+    const today = getTodayISO();
+    const { data: todayWorkers } = await supabase.from('schedule').select('user_id, user_name').eq('work_date', today).eq('department', me.managed_department);
+    allUsers = (todayWorkers || []).map(w => ({ id: w.user_id, name: w.user_name }));
+    if (allUsers.length === 0) return ctx.reply(`Сегодня в графике отдела "${me.managed_department}" никто не числится — некому ставить задачу.`);
+  } else {
+    const { data: others } = await supabase.from('users').select('id, name').neq('id', userId);
+    allUsers = others || [];
+  }
+
+  if (allUsers.length === 0) return ctx.reply('Нет сотрудников в базе.');
 
   const buttons = allUsers.map(u => [Markup.button.callback(u.name, `task_to_${u.id}`)]);
   ctx.reply('Кому поставить задачу?', Markup.inlineKeyboard(buttons));
@@ -906,7 +987,11 @@ bot.hears('❌ Отменить мою бронь', async (ctx) => {
   const userId = ctx.from.id.toString();
   const today = getTodayISO();
   const { error } = await supabase.from('bookings').delete().eq('user_id', userId).eq('booking_date', today);
-  ctx.reply(error ? 'Активных броней на сегодня не найдено.' : 'Ваша бронь на сегодня отменена.', getMainMenu());
+
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  const isSuper = SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString();
+
+  ctx.reply(error ? 'Активных броней на сегодня не найдено.' : 'Ваша бронь на сегодня отменена.', getMainMenu(me && isStaff(me.role), isSuper));
 });
 
 // ==========================================
@@ -925,6 +1010,11 @@ bot.on('text', async (ctx) => {
     await clearPendingAction(userId);
     const weekDates = getCurrentWeekDates();
 
+    const { data: myInfo } = await supabase.from('users').select('role, managed_department').eq('id', userId).maybeSingle();
+    const isManager = myInfo?.role === 'manager';
+    const isAdminUser = isAdminRole(myInfo?.role) || (SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString());
+    const managerDep = isManager ? myInfo.managed_department : null;
+
     const waitMsg = await ctx.reply('🤖 Думаю...');
     const { data: allUsers } = await supabase.from('users').select('id, name');
     const result = await callGemini(ctx.message.text, weekDates, allUsers);
@@ -939,10 +1029,14 @@ bot.on('text', async (ctx) => {
     for (const e of result.entries) {
       const dep = allDepartments.find(d => d.toLowerCase() === (e.department || '').toLowerCase());
       const matchedUser = matchUserByName(e.worker || '', allUsers || []);
+      const isDutyEntry = !!e.is_duty;
 
       if (!dep) { problems.push(`Не нашёл отдел "${e.department}"`); continue; }
       if (!matchedUser) { problems.push(`Не нашёл сотрудника "${e.worker}"`); continue; }
       if (!e.date) { problems.push(`Не указана дата для "${e.worker}"`); continue; }
+
+      if (!isDutyEntry && !isAdminUser) { problems.push(`Изменение обычного графика работы (${matchedUser.name}) доступно только администратору`); continue; }
+      if (isDutyEntry && managerDep && dep !== managerDep) { problems.push(`Отдел "${dep}" не относится к вашей зоне ответственности (${managerDep})`); continue; }
 
       resolvedEntries.push({ date: e.date, department: dep, userId: matchedUser.id, userName: matchedUser.name, is_duty: !!e.is_duty, action: e.action === 'remove' ? 'remove' : 'add' });
     }
