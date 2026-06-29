@@ -11,9 +11,27 @@ const geminiUrl = (model) => `https://generativelanguage.googleapis.com/v1beta/m
 // Твой личный Telegram ID — только этот аккаунт может менять права доступа других людей
 const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_ID;
 
+// Координаты магазина и допустимый радиус чекина
+const STORE_LAT = parseFloat(process.env.STORE_LAT);
+const STORE_LON = parseFloat(process.env.STORE_LON);
+const CHECKIN_RADIUS_M = 300;
+const CHECKIN_DEADLINE = '10:00'; // граница "вовремя" по времени Алматы
+
+// Дистанция между двумя точками в метрах (формула гаверсинусов)
+const getDistanceMeters = (lat1, lon1, lat2, lon2) => {
+  const R = 6371000;
+  const toRad = (deg) => deg * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
+};
+
 // Версия бота — меняй строку при каждом значимом обновлении кода/кнопок,
 // чтобы бот сам предлагал пользователям нажать /start для обновления меню
-const BOT_VERSION = '2026-06-25-1';
+const BOT_VERSION = '2026-06-29-2';
 
 // Группы отделов для очереди обедов
 const departmentGroups = {
@@ -55,6 +73,7 @@ const getMainMenu = (staff = false, isSuper = false) => {
     ['🔥 Дежурные на сегодня', '📆 График на сегодня'],
     ['📝 График работы на неделю', '🙋 Бронь Завтрака и обеда'],
     ['❌ Отменить мою бронь']
+    ['📍 Я пришёл']
   ];
   if (staff) rows.push(['📌 Поставить задачу', '📋 Задачи команды']);
   if (staff) rows.push(['🤖 Написать график текстом']);
@@ -994,9 +1013,74 @@ bot.hears('❌ Отменить мою бронь', async (ctx) => {
   ctx.reply(error ? 'Активных броней на сегодня не найдено.' : 'Ваша бронь на сегодня отменена.', getMainMenu(me && isStaff(me.role), isSuper));
 });
 
+bot.hears('📍 Я пришёл', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const today = getTodayISO();
+
+  const { data: existing } = await supabase.from('attendance').select('id').eq('user_id', userId).eq('work_date', today).maybeSingle();
+  if (existing) return ctx.reply('Вы уже отметились сегодня.');
+
+  ctx.reply(
+    '📍 Отправьте вашу геолокацию для отметки прихода:',
+    Markup.keyboard([[Markup.button.locationRequest('📍 Отправить локацию')]]).resize().oneTime()
+  );
+});
+
 // ==========================================
 // ОБРАБОТКА СВОБОДНОГО ТЕКСТА (должен идти после всех bot.hears)
 // ==========================================
+
+bot.on('location', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const today = getTodayISO();
+  const { latitude, longitude } = ctx.message.location;
+
+  const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
+  const userName = user?.name || formatTelegramName(ctx.from);
+
+  // Повторная проверка на дублирующий чекин (race condition: два location-сообщения подряд)
+  const { data: existing } = await supabase.from('attendance').select('id').eq('user_id', userId).eq('work_date', today).maybeSingle();
+  if (existing) return ctx.reply('Вы уже отметились сегодня.', getMainMenu());
+
+  if (isNaN(STORE_LAT) || isNaN(STORE_LON)) {
+    console.error('STORE_LAT/STORE_LON не заданы в переменных окружения');
+    return ctx.reply('⚠️ Координаты магазина не настроены. Обратитесь к администратору.', getMainMenu());
+  }
+
+  const distance = getDistanceMeters(latitude, longitude, STORE_LAT, STORE_LON);
+
+  const now = getAlmatyNow();
+  const [deadlineH, deadlineM] = CHECKIN_DEADLINE.split(':').map(Number);
+  const isOnTime = (now.getUTCHours() < deadlineH) ||
+                    (now.getUTCHours() === deadlineH && now.getUTCMinutes() <= deadlineM);
+  const isInRange = distance <= CHECKIN_RADIUS_M;
+
+  const status = (isOnTime && isInRange) ? 'вовремя' : 'опоздал';
+
+  const { error } = await supabase.from('attendance').insert({
+    user_id: userId,
+    user_name: userName,
+    work_date: today,
+    latitude,
+    longitude,
+    distance_m: distance,
+    status
+  });
+
+  if (error) {
+    console.error('Ошибка записи чекина:', error);
+    return ctx.reply('⚠️ Не удалось сохранить чекин. Попробуйте позже.', getMainMenu());
+  }
+
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  const isSuper = SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString();
+
+  let reply = status === 'вовремя'
+    ? `✅ Чекин принят, вы вовремя! (${distance} м от магазина)`
+    : `⚠️ Чекин принят со статусом "опоздал" (${distance} м от магазина${!isInRange ? ', вне радиуса' : ''}${!isOnTime ? ', после ' + CHECKIN_DEADLINE : ''}).`;
+
+  ctx.reply(reply, getMainMenu(me && isStaff(me.role), isSuper));
+});
 
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id.toString();
