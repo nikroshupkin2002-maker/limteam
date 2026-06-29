@@ -730,12 +730,21 @@ bot.hears('📋 Задачи команды', async (ctx) => {
   }
   if (!tasks || tasks.length === 0) return ctx.reply('Активных задач нет.');
 
+  const amISuperAdmin = SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString();
+  const canDelete = isAdminRole(me.role) || amISuperAdmin;
+
   let text = '📋 *Последние задачи команды:*\n\n';
-  tasks.forEach(t => {
+  tasks.forEach((t, i) => {
     const statusIcon = t.status === 'done' ? '✅' : '⏳';
-    text += `${statusIcon} *${t.to_user_name}*: ${t.text}\n`;
+    text += `${i + 1}. ${statusIcon} *${t.to_user_name}*: ${t.text}\n`;
   });
-  ctx.replyWithMarkdown(text);
+
+  if (canDelete) {
+    const buttons = tasks.map((t, i) => [Markup.button.callback(`🗑️ Удалить №${i + 1} (${t.to_user_name})`, `task_delete_${t.id}`)]);
+    ctx.replyWithMarkdown(text, Markup.inlineKeyboard(buttons));
+  } else {
+    ctx.replyWithMarkdown(text);
+  }
 });
 
 bot.action(/^task_done_(.+)$/, async (ctx) => {
@@ -758,6 +767,29 @@ bot.action(/^task_done_(.+)$/, async (ctx) => {
   try {
     await bot.telegram.sendMessage(task.from_user_id, `✅ ${task.to_user_name} выполнил(а) задачу: "${task.text}"`);
   } catch (e) {}
+});
+
+bot.action(/^task_delete_(.+)$/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const { data: me } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  const amISuperAdmin = SUPER_ADMIN_ID && userId === SUPER_ADMIN_ID.toString();
+
+  if (!amISuperAdmin && (!me || !isAdminRole(me.role))) {
+    return ctx.answerCbQuery('⛔ Удалять задачи может только администратор', { show_alert: true });
+  }
+
+  const taskId = ctx.match[1];
+  const { data: task } = await supabase.from('tasks').select('text, to_user_name').eq('id', taskId).maybeSingle();
+  if (!task) return ctx.answerCbQuery('Задача не найдена (возможно, уже удалена)', { show_alert: true });
+
+  const { error } = await supabase.from('tasks').delete().eq('id', taskId);
+  if (error) {
+    console.error('Ошибка удаления задачи:', error);
+    return ctx.answerCbQuery('⚠️ Не удалось удалить задачу', { show_alert: true });
+  }
+
+  ctx.answerCbQuery('Задача удалена 🗑️');
+  ctx.editMessageText(`🗑️ *Удалено:* ${task.text} (для ${task.to_user_name})`, { parse_mode: 'Markdown' });
 });
 
 
